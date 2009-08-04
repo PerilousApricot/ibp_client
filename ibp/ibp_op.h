@@ -34,11 +34,11 @@ http://www.accre.vanderbilt.edu
 #ifndef __IBP_OP_H_
 #define __IBP_OP_H_
 
-#include "stack.h"
-#include "network.h"
+#include "../stack.h"
+#include "../network.h"
 //#include "ibp_config.h"
-#include "oplist.h"
-#include "host_portal.h"
+#include "../oplist.h"
+#include "../host_portal.h"
 #include <pthread.h>
 
 #ifdef __cplusplus

@@ -319,10 +319,11 @@ int fd_connect(int *fd, const char *hostname, int port, int tcpsize, Net_timeout
    }
 
    // Get ip address
-   if (lookup_host(hostname, in_addr) != 0) {
-      log_printf(15, "fd_connect: lookup_host failed.  Hostname: %s  Port: %d\n", hostname, port);
-      return(1);
-   }
+#warning "WARNING WARNING WARNING call to lookup_host didn't change with lookup_host, check this against dns_cache .. I had to get rid of these lines to get the code to compile, but I don't know enough about it to fix it (you have sockaddr_in here, but dns_cache returns a char * -Andrew Melo"
+//   if (lookup_host(hostname, in_addr) != 0) {
+//      log_printf(15, "fd_connect: lookup_host failed.  Hostname: %s  Port: %d\n", hostname, port);
+//      return(1);
+//   }
    
    // get the socket
    sfd = socket(PF_INET, SOCK_STREAM, 0);

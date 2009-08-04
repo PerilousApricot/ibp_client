@@ -36,6 +36,7 @@ http://www.accre.vanderbilt.edu
 #include "log.h"
 #include "ibp.h"
 #include "iovec_sync.h"
+#include "fmttypes.h"
 
 #define A_DURATION 900
 

@@ -34,7 +34,7 @@ http://www.accre.vanderbilt.edu
 
 #ifndef __FMTTYPES_
 #define __FMTTYPES_
-
+#include "config.h" // pulls in defines
 #ifdef _LINUX64BIT
 #  define LU  "%lu"      // uint64_t 
 #  define OT  "%lu"      // offset_t
