@@ -29,7 +29,7 @@ OPTION( _ENABLE_PHOEBUS "Enable Phoebus support" OFF )
 CONFIGURE_FILE( ${CMAKE_SOURCE_DIR}/config.h.cmake ${CMAKE_SOURCE_DIR}/config.h )
 
 # common objects
-SET(NETWORK_OBJS network net_sock net_1_ssl net_2_ssl net_fd net_phoebus )
+SET(NETWORK_OBJS network net_sock net_1_ssl net_2_ssl net_phoebus )
 
 SET(IBP_OBJS 
     hconnection 
