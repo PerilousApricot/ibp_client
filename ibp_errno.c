@@ -21,29 +21,29 @@
 
 // *** Modified by Alan Tackett on 7/7/2008 for sync/async compatiblity
 
-#include <errno.h>
-#include <pthread.h>
 #include <stdlib.h>
+#include <apr_pools.h>
+#include <apr_thread_proc.h>
 
-pthread_once_t  errno_once = PTHREAD_ONCE_INIT;
-static pthread_key_t errno_key;
+static apr_threadkey_t *errno_key;
 
-void _set_errno( int err ) { errno = err; }
-int _get_errno () { return(errno) ; }
+apr_thread_once_t *_err_once = NULL;
+extern apr_pool_t *_ibp_mpool;
 
-void _errno_destructor( void *ptr)	{ free(ptr);}
-void _errno_once(void) { pthread_key_create(&errno_key,_errno_destructor);}
+void _errno_destructor( void *ptr) { free(ptr); }
+
+void _errno_once(void) { apr_threadkey_private_create(&errno_key,_errno_destructor, _ibp_mpool);}
 int *_IBP_errno() 
 {
-  int *output;
+  void *output = NULL;
 
-  pthread_once(&errno_once,_errno_once);
-  output = (int *)pthread_getspecific(errno_key);
+  apr_thread_once(_err_once,_errno_once);
+  apr_threadkey_private_get(&output, errno_key);
   if (output == NULL ){
-     output = (int*)calloc(1,sizeof(int));
-     pthread_setspecific(errno_key,output);
+     output = (void *)malloc(sizeof(int));
+     apr_threadkey_private_set(output, errno_key);
   }
 
-  return(output);
+  return((int *)output);
 }
 

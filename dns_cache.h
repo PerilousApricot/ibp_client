@@ -33,14 +33,17 @@ http://www.accre.vanderbilt.edu
 #ifndef __DNS_CACHE_H__
 #define __DNS_CACHE_H__
 
-#include <netdb.h>
-#include <sys/socket.h>
-
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-int lookup_host(char *, char *);
+//#define DNS_IPV4_LEN 4
+//#define DNS_IPV6_LEN 16
+#define DNS_ADDR_MAX 4
+#define DNS_IPV4  0
+#define DNS_IPV6  1
+
+int lookup_host(const char *, char *, char *);
 void dns_cache_init(int);
 void finalize_dns_cache();
 

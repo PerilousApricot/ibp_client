@@ -39,14 +39,14 @@ http://www.accre.vanderbilt.edu
 #include <stdio.h>
 #include <log.h>
 
-extern FILE *_debug_fd;   //**Default all I/O to stdout
-extern int _debug_level;
+//extern FILE *_debug_fd;   //**Default all I/O to stdout
+//extern int _debug_level;
 
 #define debug_code(a) a
 #define debug_printf(n, ...) log_printf(n, __VA_ARGS__)
-#define set_debug_level(n) _debug_level = n
+#define set_debug_level(n) set_log_level(n)
 #define flush_debug() flush_log()
-#define debug_level() _debug_level
+#define debug_level() log_level()
 
 #else
 

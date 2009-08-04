@@ -35,9 +35,9 @@ http://www.accre.vanderbilt.edu
 
 #define N_BUFSIZE  1024
 
-#include <sys/select.h>
-#include <sys/time.h>
-#include <pthread.h>
+//#include <sys/select.h>
+//#include <sys/time.h>
+//#include <pthread.h>
 #include "network.h"
 
 typedef struct {

@@ -31,6 +31,7 @@ http://www.accre.vanderbilt.edu
 #include <string.h>
 #include <assert.h>
 #include <stdio.h>
+#include <apr_thread_proc.h>
 #include "dns_cache.h"
 #include "host_portal.h"
 #include "fmttypes.h"
@@ -38,28 +39,18 @@ http://www.accre.vanderbilt.edu
 #include "log.h"
 #include "string_token.h"
 
-//************************************************************************
-// Base thread routines
-//************************************************************************
-
-//#define hportal_lock(hp)   pthread_mutex_lock(&(hp->lock))
-//#define hportal_unlock(hp) pthread_mutex_unlock(&(hp->lock))
-//#define hportal_signal(hp) pthread_cond_broadcast(&(hp->cond))
-
-
 //***************************************************************************
 //  hportal_wait - Waits up to the specified time for the condition
 //***************************************************************************
 
 void hportal_wait(Host_portal_t *hp, int dt)  
 {
-   struct timespec ts;
+   apr_interval_time_t t;
 
    if (dt < 0) return;   //** If negative time has run out so return
- 
-   ts.tv_sec = time(NULL) + dt;
-   ts.tv_nsec = 0;
-   pthread_cond_timedwait(&(hp->cond), &(hp->lock), &ts);
+
+   set_net_timeout(&t, dt, 0); 
+   apr_thread_cond_timedwait(hp->cond, hp->lock, t);
 }
 
 
@@ -71,9 +62,9 @@ int get_hpc_thread_count(Hportal_context_t *hpc)
 {
   int n;
 
-  pthread_mutex_lock(&(hpc->lock));
+  apr_thread_mutex_lock(hpc->lock);
   n = hpc->running_threads;
-  pthread_mutex_unlock(&(hpc->lock));
+  apr_thread_mutex_unlock(hpc->lock);
 
   return(n);
 }
@@ -84,9 +75,9 @@ int get_hpc_thread_count(Hportal_context_t *hpc)
 
 void modify_hpc_thread_count(Hportal_context_t *hpc, int n)
 {
-  pthread_mutex_lock(&(hpc->lock));
+  apr_thread_mutex_lock(hpc->lock);
   hpc->running_threads = hpc->running_threads + n;
-  pthread_mutex_unlock(&(hpc->lock));
+  apr_thread_mutex_unlock(hpc->lock);
 
 }
 
@@ -100,6 +91,7 @@ Host_portal_t *create_hportal(Hportal_context_t *hpc, void *connect_context, cha
 
 log_printf(15, "create_hportal: hpc=%p\n", hpc);
   assert((hp = (Host_portal_t *)malloc(sizeof(Host_portal_t))) != NULL);
+  assert(apr_pool_create(&(hp->mpool), NULL) == APR_SUCCESS);
   
   char host[sizeof(hp->host)];
   int port;
@@ -118,7 +110,7 @@ log_printf(15, "create_hportal: hpc=%p\n", hpc);
 
   //** Check if we can resolve the host's IP address
   char in_addr[6];
-  if (lookup_host(host, in_addr) != 0) {
+  if (lookup_host(host, in_addr, NULL) != 0) {
      log_printf(1, "create_hportal: Can\'t resolve host address: %s:%d\n", host, port);
      hp->invalid_host = 1;
   } else {
@@ -141,8 +133,12 @@ log_printf(15, "create_hportal: hpc=%p\n", hpc);
   hp->sync_list = new_stack();
   hp->pause_until = 0;
   hp->stable_conn = hpc->max_threads;
-  pthread_mutex_init(&(hp->lock), NULL);
-  pthread_cond_init(&(hp->cond), NULL);
+  hp->failed_conn_attempts = 0;
+  hp->successful_conn_attempts = 0;
+  hp->abort_conn_attempts = hpc->abort_conn_attempts;
+
+  apr_thread_mutex_create(&(hp->lock), APR_THREAD_MUTEX_DEFAULT, hp->mpool);
+  apr_thread_cond_create(&(hp->cond), hp->mpool);
 
   return(hp);
 }
@@ -154,10 +150,10 @@ log_printf(15, "create_hportal: hpc=%p\n", hpc);
 void _reap_hportal(Host_portal_t *hp)
 {
    Host_connection_t *hc;
-   void *value;
+   apr_status_t value;
 
    while ((hc = (Host_connection_t *)pop(hp->closed_que)) != NULL) {
-     pthread_join(hc->recv_thread, &value);
+     apr_thread_join(&value, hc->recv_thread);
      destroy_host_connection(hc);
    }
 }
@@ -177,27 +173,13 @@ void destroy_hportal(Host_portal_t *hp)
   
   hp->context->imp->destroy_connect_context(hp->connect_context);
 
-  pthread_mutex_destroy(&(hp->lock));
-  pthread_cond_destroy(&(hp->cond));
+  apr_thread_mutex_destroy(hp->lock);
+  apr_thread_cond_destroy(hp->cond);
 
-  
-  log_printf(5, "destroy_hportal: Total commands processed: " LU " (host:%s:%d)\n", hp->cmds_processed,
+  apr_pool_destroy(hp->mpool);  
+  log_printf(5, "destroy_hportal: Total commands processed: " I64T " (host:%s:%d)\n", hp->cmds_processed,
          hp->host, hp->port);
   free(hp);
-}
-
-//************************************************************************
-//  hportal_hash_destroy - Used by the glib hash table function to destroy
-//       and entry
-//************************************************************************
-
-void hportal_hash_destroy(gpointer data)
-{
-  Host_portal_t *hp = (Host_portal_t *)data;
-
-  destroy_hportal(hp);
-
-  return;
 }
 
 //************************************************************************
@@ -209,7 +191,8 @@ Host_portal_t *_lookup_hportal(Hportal_context_t *hpc, char *hostport)
   Host_portal_t *hp;
   
 //log_printf(1, "_lookup_hportal: hpc=%p hpc->table=%p\n", hpc, hpc->table);
-  hp = (Host_portal_t *)(g_hash_table_lookup(hpc->table, hostport));
+  hp = (Host_portal_t *)(apr_hash_get(hpc->table, hostport, APR_HASH_KEY_STRING));
+//log_printf(1, "_lookup_hportal: hpc=%p hpc->table=%p hp=%p hostport=%s\n", hpc, hpc->table, hp, hostport);
 
   return(hp);
 }
@@ -228,11 +211,12 @@ Hportal_context_t *create_hportal_context(Hportal_impl_t *imp)
   memset(hpc, 0, sizeof(Hportal_context_t));
 
 
-  assert((hpc->table = g_hash_table_new_full(g_str_hash, g_str_equal, NULL, hportal_hash_destroy)) != NULL);
+  assert(apr_pool_create(&(hpc->pool), NULL) == APR_SUCCESS);
+  assert((hpc->table = apr_hash_make(hpc->pool)) != NULL);
 
-//printf("create_hportal_context: hpc=%p hpc->table=%p\n", hpc, hpc->table);
+//log_printf(15, "create_hportal_context: hpc=%p hpc->table=%p\n", hpc, hpc->table);
 
-  pthread_mutex_init(&(hpc->lock), NULL);
+  apr_thread_mutex_create(&(hpc->lock), APR_THREAD_MUTEX_DEFAULT, hpc->pool);
 
   hpc->imp = imp;
   hpc->next_check = time(NULL);
@@ -249,10 +233,21 @@ Hportal_context_t *create_hportal_context(Hportal_impl_t *imp)
 
 void destroy_hportal_context(Hportal_context_t *hpc)
 {
-  g_hash_table_destroy(hpc->table);  
+  apr_hash_index_t *hi; 
+  Host_portal_t *hp;
+  void *val;
 
-  pthread_mutex_destroy(&(hpc->lock));  
+  for (hi=apr_hash_first(hpc->pool, hpc->table); hi != NULL; hi = apr_hash_next(hi)) {
+     apr_hash_this(hi, NULL, NULL, &val); hp = (Host_portal_t *)val;  
+     apr_hash_set(hpc->table, hp->skey, APR_HASH_KEY_STRING, NULL);
+     destroy_hportal(hp);
+  }
 
+  apr_thread_mutex_destroy(hpc->lock);  
+
+  apr_hash_clear(hpc->table);
+  apr_pool_destroy(hpc->pool);
+  
   free(hpc);
 
   return;
@@ -309,11 +304,11 @@ void shutdown_sync(Host_portal_t *hp)
         hc = (Host_connection_t *)get_ele_data(shp->conn_list);
 
         hportal_unlock(shp);
-        pthread_mutex_unlock(&(hp->context->lock));
+        apr_thread_mutex_unlock(hp->context->lock);
 
         close_hc(hc);
 
-        pthread_mutex_lock(&(hp->context->lock));
+        apr_thread_mutex_lock(hp->context->lock);
         hportal_lock(shp);
      }
 
@@ -330,18 +325,16 @@ void shutdown_sync(Host_portal_t *hp)
 
 void shutdown_hportal(Hportal_context_t *hpc)
 {
-  GList *root, *ptr;
   Host_portal_t *hp;
   Host_connection_t *hc;
-  Stack_t *unused_hp = new_stack();
-  char *skey;
+  apr_hash_index_t *hi;
+  void *val;
 
-  pthread_mutex_lock(&(hpc->lock));
-  root = g_hash_table_get_values(hpc->table);
+  apr_thread_mutex_lock(hpc->lock);
 
-  ptr = root;
-  while (ptr != NULL) {
-     hp = (Host_portal_t *)ptr->data;
+  for (hi=apr_hash_first(hpc->pool, hpc->table); hi != NULL; hi = apr_hash_next(hi)) {
+     apr_hash_this(hi, NULL, NULL, &val); hp = (Host_portal_t *)val;  
+     apr_hash_set(hpc->table, hp->skey, APR_HASH_KEY_STRING, NULL);  //** This removes the key
 
      hportal_lock(hp);
      _reap_hportal(hp);  //** clean up any closed connections
@@ -353,35 +346,22 @@ void shutdown_hportal(Hportal_context_t *hpc)
         free_stack(hp->que, 1);  //** Empty the que so we don't respawn connections
         hp->que = new_stack();
         hportal_unlock(hp);
-        pthread_mutex_unlock(&(hpc->lock));
+        apr_thread_mutex_unlock(hpc->lock);
 
         close_hc(hc);
 
-        pthread_mutex_lock(&(hpc->lock));
+        apr_thread_mutex_lock(hpc->lock);
         hportal_lock(hp);
 
         move_to_top(hp->conn_list);
      }     
 
-     //** Possible race conditon so don't delete the hash entry here!
-     //** destroy_hportal is called via a callback in remove below
-     skey = strdup(hp->skey);
-     push(unused_hp, (void *)skey);
-
      hportal_unlock(hp);
 
-     ptr = ptr->next;
+     destroy_hportal(hp);
   }
 
-  //*** Actually remove the hash entry
-  while ((skey = (char *)pop(unused_hp)) != NULL) {
-     g_hash_table_remove(hpc->table, skey); //** callback removes hp struct
-     free(skey);
-  }
-
-  free_stack(unused_hp, 0);
-
-  pthread_mutex_unlock(&(hpc->lock));
+  apr_thread_mutex_unlock(hpc->lock);
 
   return;  
 }
@@ -421,19 +401,14 @@ void compact_hportal_sync(Host_portal_t *hp)
 
 void compact_hportals(Hportal_context_t *hpc)
 {
-  GList *root, *ptr;
+  apr_hash_index_t *hi;
   Host_portal_t *hp;
-  Stack_t *unused_hp;
-  char *skey;
+  void *val;
 
-  unused_hp = new_stack();
+  apr_thread_mutex_lock(hpc->lock);
 
-  pthread_mutex_lock(&(hpc->lock));
-  root = g_hash_table_get_values(hpc->table);
-
-  ptr = root;
-  while (ptr != NULL) {
-     hp = (Host_portal_t *)ptr->data;
+  for (hi=apr_hash_first(hpc->pool, hpc->table); hi != NULL; hi = apr_hash_next(hi)) {
+     apr_hash_this(hi, NULL, NULL, &val); hp = (Host_portal_t *)val;  
 
      hportal_lock(hp);
 
@@ -442,25 +417,15 @@ void compact_hportals(Hportal_context_t *hpc)
      compact_hportal_sync(hp);
 
      if ((hp->n_conn == 0) && (stack_size(hp->que) == 0) && (stack_size(hp->sync_list) == 0)) { //** if not used so remove it
-        //** Possible race conditon so don't delete the hash entry here!
-        //** destroy_hportal is called via a callback in remove below
-        skey = strdup(hp->skey);
-        push(unused_hp, (void *)skey);
+       hportal_unlock(hp);
+       apr_hash_set(hpc->table, hp->skey, APR_HASH_KEY_STRING, NULL);  //** This removes the key
+       destroy_hportal(hp);
      } else {
        hportal_unlock(hp);
      }
-
-     ptr = ptr->next;
   }
 
-  //*** Actually remove the hash entry
-  while ((skey = (char *)pop(unused_hp)) != NULL) {
-     g_hash_table_remove(hpc->table, skey); //** callback removes hp struct
-     free(skey);
-  }
-
-  free_stack(unused_hp, 0);
-  pthread_mutex_unlock(&(hpc->lock));
+  apr_thread_mutex_unlock(hpc->lock);
 }
 
 //*************************************************************************
@@ -507,9 +472,10 @@ Hportal_stack_op_t *_get_hportal_op(Host_portal_t *hp)
 
 Host_connection_t *find_hc_to_close(Hportal_context_t *hpc)
 {
-  GList *root, *ptr;
+  apr_hash_index_t *hi;
   Host_portal_t *hp, *shp;
   Host_connection_t *hc, *best_hc, *best_sync;
+  void *val;
   int best_workload;
   int oldest_sync_time;
 
@@ -519,12 +485,11 @@ Host_connection_t *find_hc_to_close(Hportal_context_t *hpc)
   oldest_sync_time = time(NULL) + 1;
   best_sync = NULL;
 
-  pthread_mutex_lock(&(hpc->lock));
-  root = g_hash_table_get_values(hpc->table);
+  apr_thread_mutex_lock(hpc->lock);
 
-  ptr = root;
-  while (ptr != NULL) {
-     hp = (Host_portal_t *)ptr->data;
+  for (hi=apr_hash_first(hpc->pool, hpc->table); hi != NULL; hi = apr_hash_next(hi)) {
+     apr_hash_this(hi, NULL, NULL, &val); hp = (Host_portal_t *)val;  
+     apr_hash_set(hpc->table, hp->skey, APR_HASH_KEY_STRING, NULL);  //** This removes the key
 
      hportal_lock(hp);
 
@@ -559,11 +524,9 @@ Host_connection_t *find_hc_to_close(Hportal_context_t *hpc)
      }
 
      hportal_unlock(hp);
-
-     ptr = ptr->next;
   }
 
-  pthread_mutex_unlock(&(hpc->lock));
+  apr_thread_mutex_unlock(hpc->lock);
 
   hc = best_hc;
   if (best_sync != NULL) {
@@ -682,15 +645,15 @@ Host_portal_t *submit_hportal_sync(Hportal_context_t *hpc, oplist_t *oplist, voi
    Host_connection_t *hc;
    Hportal_op_t *hop = hpc->imp->get_hp_op(op);
 
-   pthread_mutex_lock(&(hpc->lock));
+   apr_thread_mutex_lock(hpc->lock);
 
    //** Check if we should do a garbage run **
    if (hpc->next_check < time(NULL)) { 
        hpc->next_check = time(NULL) + hpc->compact_interval;
 
-       pthread_mutex_unlock(&(hpc->lock));  
+       apr_thread_mutex_unlock(hpc->lock);  
        compact_hportals(hpc);
-       pthread_mutex_lock(&(hpc->lock));
+       apr_thread_mutex_lock(hpc->lock);
    }
 
    //** Find it in the list or make a new one
@@ -700,13 +663,13 @@ Host_portal_t *submit_hportal_sync(Hportal_context_t *hpc, oplist_t *oplist, voi
       hp = create_hportal(hpc, hop->connect_context, hop->hostport, hpc->min_threads, hpc->max_threads);
       if (hp == NULL) {
           log_printf(15, "submit_hportal_sync: create_hportal failed!\n");
-          pthread_mutex_unlock(&(hpc->lock));
+          apr_thread_mutex_unlock(hpc->lock);
           return(NULL);
       }
-      g_hash_table_insert(hpc->table, hp->skey, hp);      
+      apr_hash_set(hpc->table, hp->skey, APR_HASH_KEY_STRING, (const void *)hp);      
    }
 
-   pthread_mutex_unlock(&(hpc->lock));
+   apr_thread_mutex_unlock(hpc->lock);
 
    log_printf(15, "submit_hportal_sync: start opid=%d\n", oplist->id);
 
@@ -788,15 +751,16 @@ int submit_hp_op(Hportal_context_t *hpc, oplist_t *oplist, void *op)
 {
    Hportal_op_t *hop = hpc->imp->get_hp_op(op);
 
-   pthread_mutex_lock(&(hpc->lock));
+   apr_thread_mutex_lock(hpc->lock);
 
    //** Check if we should do a garbage run **
    if (hpc->next_check < time(NULL)) { 
        hpc->next_check = time(NULL) + hpc->compact_interval;
 
-       pthread_mutex_unlock(&(hpc->lock));  
+       apr_thread_mutex_unlock(hpc->lock);  
+       log_printf(15, "submit_hp_op: Calling compact_hportals\n");
        compact_hportals(hpc);
-       pthread_mutex_lock(&(hpc->lock));
+       apr_thread_mutex_lock(hpc->lock);
    }
 
 //log_printf(1, "submit_hp_op: hpc=%p hpc->table=%p\n",hpc, hpc->table);
@@ -808,10 +772,13 @@ int submit_hp_op(Hportal_context_t *hpc, oplist_t *oplist, void *op)
           log_printf(15, "submit_op: create_hportal failed!\n");
           return(1);
       }
-      g_hash_table_insert(hpc->table, hp->skey, hp);      
+      log_printf(15, "submit_op: New host.. hp->skey=%s\n", hp->skey);
+      apr_hash_set(hpc->table, hp->skey, APR_HASH_KEY_STRING, (const void *)hp);      
+Host_portal_t *hp2 = _lookup_hportal(hpc, hop->hostport);
+log_printf(15, "submit_op: after lookup hp2=%p\n", hp2);
    }
 
-   pthread_mutex_unlock(&(hpc->lock));
+   apr_thread_mutex_unlock(hpc->lock);
 
    return(submit_hportal(hp, oplist, op, 0));
 }

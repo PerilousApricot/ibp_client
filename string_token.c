@@ -29,7 +29,7 @@ http://www.accre.vanderbilt.edu
 
 //#include <stdlib.h>
 //#include <stdio.h>
-#include <string.h>
+#include <apr_strings.h>
 
 
 char NULL_TERMINATOR = '\0';
@@ -42,7 +42,7 @@ char NULL_TERMINATOR = '\0';
 
 char *string_token(char *str, const char *sep, char **last, int *finished) 
 {
-  char *token = strtok_r(str, sep, last);
+  char *token = apr_strtok(str, sep, last);
 
   if (token == NULL) {
      token = &NULL_TERMINATOR;

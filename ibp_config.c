@@ -28,7 +28,9 @@ http://www.accre.vanderbilt.edu
 */
 
 #include <assert.h>
-#include <glib.h>
+#include <apr_pools.h>
+#include <apr_thread_proc.h>
+#include "iniparse.h"
 #include "dns_cache.h"
 #include "host_portal.h"
 #include "ibp.h"
@@ -41,6 +43,9 @@ http://www.accre.vanderbilt.edu
 #include "log.h"
 #include "phoebus.h"
 
+extern apr_thread_once_t *_err_once;
+
+apr_pool_t *_ibp_mpool = NULL;
 Hportal_context_t *_hpc_config;
 ibp_config_t global_ibp_config;
 ibp_config_t *_ibp_config;
@@ -129,7 +134,7 @@ int _ibp_connect(NetStream_t *ns, void *connect_context, char *host, int port, N
   if (cc != NULL) {
      switch(cc->type) {
        case NS_TYPE_SOCK:
-          ns_config_sock(ns, -1, _ibp_config->tcpsize);
+          ns_config_sock(ns, _ibp_config->tcpsize);
           break;
        case NS_TYPE_PHOEBUS:
           ns_config_phoebus(ns, cc->data, _ibp_config->tcpsize);
@@ -145,7 +150,7 @@ int _ibp_connect(NetStream_t *ns, void *connect_context, char *host, int port, N
           return(1);
       }
   } else {
-     ns_config_sock(ns, -1, _ibp_config->tcpsize);
+     ns_config_sock(ns, _ibp_config->tcpsize);
   }
 
   return(net_connect(ns, host, port, timeout));
@@ -156,6 +161,8 @@ int _ibp_connect(NetStream_t *ns, void *connect_context, char *host, int port, N
 // set/unset routines for options
 //**********************************************************
 
+void ibp_set_abort_attempts(int n) { _ibp_config->abort_conn_attempts = n;};
+int  ibp_get_abort_attempts() { return(_ibp_config->abort_conn_attempts); };
 void ibp_set_tcpsize(int n) { _ibp_config->tcpsize = n;};
 int  ibp_get_tcpsize() { return(_ibp_config->tcpsize); };
 void ibp_set_min_depot_threads(int n) { _ibp_config->min_threads = n; _hpc_config->min_threads = n;};
@@ -181,7 +188,7 @@ int  ibp_get_max_retry() { return(_ibp_config->max_retry); };
 
 void set_ibp_config(ibp_config_t *cfg)
 {
-  *_ibp_config = *cfg;
+  if (_ibp_config != cfg) *_ibp_config = *cfg;
 
   _hpc_config->min_idle = cfg->min_idle;
   _hpc_config->min_threads = cfg->min_threads;
@@ -189,6 +196,7 @@ void set_ibp_config(ibp_config_t *cfg)
   _hpc_config->max_connections = cfg->max_connections;
   _hpc_config->max_workload = cfg->max_workload;
   _hpc_config->wait_stable_time = cfg->wait_stable_time;
+  _hpc_config->abort_conn_attempts = cfg->abort_conn_attempts;
   _hpc_config->check_connection_interval = cfg->check_connection_interval;
   _hpc_config->max_retry = cfg->max_retry;
 }
@@ -197,9 +205,9 @@ void set_ibp_config(ibp_config_t *cfg)
 // cc_load - Stores a CC from the given keyfile
 //**********************************************************
 
-void cc_load(GKeyFile *kf, char *name, ibp_connect_context_t *cc)
+void cc_load(inip_file_t *kf, char *name, ibp_connect_context_t *cc)
 {
-  char *type = g_key_file_get_string(kf, "ibp_connect", name, NULL);
+  char *type = inip_get_string(kf, "ibp_connect", name, NULL);
 
   if (type == NULL) return;
   
@@ -220,7 +228,7 @@ void cc_load(GKeyFile *kf, char *name, ibp_connect_context_t *cc)
 // ibp_cc_table_load - Loads the default connect_context for commands
 //**********************************************************
 
-void ibp_cc_load(GKeyFile *kf, ibp_config_t *cfg)
+void ibp_cc_load(inip_file_t *kf, ibp_config_t *cfg)
 {
   int i;
   ibp_connect_context_t cc;
@@ -238,8 +246,8 @@ void ibp_cc_load(GKeyFile *kf, ibp_config_t *cfg)
   cc_load(kf, "ibp_load", &(cfg->cc[IBP_LOAD]));
   cc_load(kf, "ibp_manage", &(cfg->cc[IBP_MANAGE]));
   cc_load(kf, "ibp_write", &(cfg->cc[IBP_WRITE]));
-  cc_load(kf, "ibp_proxy_allocate", &(cfg->cc[IBP_PROXY_ALLOCATE]));
-  cc_load(kf, "ibp_proxy_manage", &(cfg->cc[IBP_PROXY_MANAGE]));
+  cc_load(kf, "ibp_alias_allocate", &(cfg->cc[IBP_ALIAS_ALLOCATE]));
+  cc_load(kf, "ibp_alias_manage", &(cfg->cc[IBP_ALIAS_MANAGE]));
   cc_load(kf, "ibp_rename", &(cfg->cc[IBP_RENAME]));
   cc_load(kf, "ibp_phoebus_send", &(cfg->cc[IBP_PHOEBUS_SEND]));
 }
@@ -251,46 +259,31 @@ void ibp_cc_load(GKeyFile *kf, ibp_config_t *cfg)
 
 int ibp_load_config(char *fname)
 {
-  GKeyFile *keyfile;
-  GKeyFileFlags flags;
-  GError *error = NULL;
-  int val;
+  inip_file_t *keyfile;
 
-  /* Create a new GKeyFile object and a bitwise list of flags. */
-  keyfile = g_key_file_new();
-  flags = G_KEY_FILE_NONE;
-
-  /* Load the GKeyFile from keyfile.conf or return. */
-  if (!g_key_file_load_from_file (keyfile, fname, flags, &error))
-  {
-    g_error (error->message);
-    return -1;
+  //* Load the config file
+  keyfile = inip_read(fname);
+  if (keyfile == NULL) {
+    log_printf(0, "ibp_load_config:  Error parsing config file! file=%s\n", fname);
+    return(-1);
   }
 
-  val = g_key_file_get_integer(keyfile, "ibp_async", "tcpsize", NULL);
-  if (val > 0) _ibp_config->tcpsize = val;
-  val = g_key_file_get_integer(keyfile, "ibp_async", "min_depot_threads", NULL);
-  if (val > 0) _ibp_config->min_threads = val;
-  val = g_key_file_get_integer(keyfile, "ibp_async", "max_depot_threads", NULL);
-  if (val > 0) _ibp_config->max_threads = val;
-  val = g_key_file_get_integer(keyfile, "ibp_async", "max_connections", NULL);
-  if (val > 0) _ibp_config->max_connections = val;
-  val = g_key_file_get_integer(keyfile, "ibp_async", "command_weight", NULL);
-  if (val > 0) _ibp_config->new_command = val;
-  val = g_key_file_get_integer(keyfile, "ibp_async", "max_thread_workload", NULL);
-  if (val > 0) _ibp_config->max_workload = val;
-  val = g_key_file_get_integer(keyfile, "ibp_async", "wait_stable_time", NULL);
-  if (val > 0) _ibp_config->wait_stable_time = val;
-  val = g_key_file_get_integer(keyfile, "ibp_async", "check_interval", NULL);
-  if (val > 0) _ibp_config->check_connection_interval = val;
-  val = g_key_file_get_integer(keyfile, "ibp_async", "max_retry", NULL);
-  if (val > 0) _ibp_config->max_retry = val;
+  _ibp_config->abort_conn_attempts = inip_get_integer(keyfile, "ibp_async", "abort_attempts", _ibp_config->abort_conn_attempts);
+  _ibp_config->tcpsize = inip_get_integer(keyfile, "ibp_async", "tcpsize", _ibp_config->tcpsize);
+  _ibp_config->min_threads = inip_get_integer(keyfile, "ibp_async", "min_depot_threads", _ibp_config->min_threads);
+  _ibp_config->max_threads = inip_get_integer(keyfile, "ibp_async", "max_depot_threads", _ibp_config->max_threads);
+  _ibp_config->max_connections = inip_get_integer(keyfile, "ibp_async", "max_connections", _ibp_config->max_connections);
+  _ibp_config->new_command = inip_get_integer(keyfile, "ibp_async", "command_weight", _ibp_config->new_command);
+  _ibp_config->max_workload = inip_get_integer(keyfile, "ibp_async", "max_thread_workload", _ibp_config->max_workload);
+  _ibp_config->wait_stable_time = inip_get_integer(keyfile, "ibp_async", "wait_stable_time", _ibp_config->wait_stable_time);
+  _ibp_config->check_connection_interval = inip_get_integer(keyfile, "ibp_async", "check_interval", _ibp_config->check_connection_interval);
+  _ibp_config->max_retry = inip_get_integer(keyfile, "ibp_async", "max_retry", _ibp_config->max_retry);
 
   ibp_cc_load(keyfile, _ibp_config);
 
   phoebus_load_config(keyfile);
   
-  g_key_file_free(keyfile);   //Free the keyfile context
+  inip_destroy(keyfile);   //Free the keyfile context
 
   set_ibp_config(_ibp_config);
 
@@ -313,6 +306,7 @@ void default_ibp_config()
   _ibp_config->new_command = 10*1024;
   _ibp_config->max_workload = 10*1024*1024;
   _ibp_config->wait_stable_time = 15;
+  _ibp_config->abort_conn_attempts = 4;
   _ibp_config->check_connection_interval = 2;
   _ibp_config->max_retry = 2;
 
@@ -334,12 +328,17 @@ void ibp_init()
 {
   _ibp_config = &global_ibp_config;
 
+  assert(apr_initialize() == APR_SUCCESS);
+
   dns_cache_init(100);
 
   ibp_configure_signals();
 
   _hpc_config = create_hportal_context(&_ibp_imp);
   default_ibp_config();  
+
+  apr_pool_create(&(_ibp_mpool), NULL);
+  apr_thread_once_init(&_err_once, _ibp_mpool);
 
   init_oplist_system();
 }
@@ -358,6 +357,10 @@ void ibp_finalize()
   destroy_oplist_system();
 
   phoebus_destroy();
+
+  apr_pool_destroy(_ibp_mpool);
+
+  apr_terminate();
 }
 
 

@@ -30,14 +30,6 @@ http://www.accre.vanderbilt.edu
 //*********************************************************************
 //*********************************************************************
 
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
-#include <sys/uio.h>
-#include <netdb.h>
-#include <unistd.h>
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
@@ -60,7 +52,8 @@ int tcp_bufsize = 0;   //** 0 means use the default TCP buffer sizes for the OS
 
 //*** These are used for counters to track connections
 int _cuid_counter = 0;
-pthread_mutex_t _net_lock = PTHREAD_MUTEX_INITIALIZER;
+apr_thread_mutex_t *_net_lock = NULL;
+apr_pool_t *_net_pool = NULL;
 //------------------
 
 NetStream_t *_get_free_conn(Network_t *net);
@@ -68,12 +61,17 @@ NetStream_t *_get_free_conn(Network_t *net);
 int ns_generate_id() {
    int id;
 
-   pthread_mutex_lock(&(_net_lock));
+   if (_net_lock == NULL) {      
+      if (_net_pool == NULL) assert(apr_pool_create(&_net_pool, NULL) == APR_SUCCESS);
+      assert(apr_thread_mutex_create(&_net_lock, APR_THREAD_MUTEX_DEFAULT, _net_pool) == APR_SUCCESS);
+   }
+
+   apr_thread_mutex_lock(_net_lock);
    id = _cuid_counter;
    log_printf(15, "ns_generate_id: _cuid=%d\n", _cuid_counter);
    _cuid_counter++;
    if (_cuid_counter > 999999999) _cuid_counter = 0;
-   pthread_mutex_unlock(&(_net_lock));
+   apr_thread_mutex_unlock(_net_lock);
 
    return(id);
 }
@@ -93,9 +91,9 @@ int get_network_tcpsize(int tcpsize)  { return(tcp_bufsize); }
 int connection_is_pending(Network_t *net)
 {
 
-  pthread_mutex_lock(&(net->ns_lock));
+  apr_thread_mutex_lock(net->ns_lock);
   int i = net->accept_pending;
-  pthread_mutex_unlock(&(net->ns_lock));
+  apr_thread_mutex_unlock(net->ns_lock);
 
   return(i);
 }
@@ -106,28 +104,28 @@ int connection_is_pending(Network_t *net)
 
 void lock_read_ns(NetStream_t *ns)
 {
-  pthread_mutex_lock(&(ns->read_lock));
+  apr_thread_mutex_lock(ns->read_lock);
 }
 
 //*********************************************************************
 
 void unlock_read_ns(NetStream_t *ns)
 {
-  pthread_mutex_unlock(&(ns->read_lock));
+  apr_thread_mutex_unlock(ns->read_lock);
 }
 
 //*********************************************************************
 
 void lock_write_ns(NetStream_t *ns)
 {
-  pthread_mutex_lock(&(ns->write_lock));
+  apr_thread_mutex_lock(ns->write_lock);
 }
 
 //*********************************************************************
 
 void unlock_write_ns(NetStream_t *ns)
 {
-  pthread_mutex_unlock(&(ns->write_lock));
+  apr_thread_mutex_unlock(ns->write_lock);
 }
 
 //*********************************************************************
@@ -165,9 +163,9 @@ int network_counter(Network_t *net)
 {
    int count;
 
-   pthread_mutex_lock(&(_net_lock));
+   apr_thread_mutex_lock(_net_lock);
    count = _cuid_counter;
-   pthread_mutex_unlock(&(_net_lock));
+   apr_thread_mutex_unlock(_net_lock);
 
    return(count);
 }
@@ -178,8 +176,7 @@ int network_counter(Network_t *net)
 
 Net_timeout_t *set_net_timeout(Net_timeout_t *tm, int sec, int us)
 {
-  tm->tv_sec = sec;
-  tm->tv_usec = us;
+  *tm = sec*1000000 + us;
 
   return(tm);
 }
@@ -199,7 +196,7 @@ void _ns_init(NetStream_t *ns, int incid)
   ns->sock_status = NULL;
   ns->set_peer = NULL;
   ns->connect = NULL;
-  
+  ns->nm = NULL;
 
   ns->last_read = time(NULL);
   ns->last_write = time(NULL);
@@ -231,16 +228,23 @@ void ns_init(NetStream_t *ns)
 
 void ns_clone(NetStream_t *dest_ns, NetStream_t *src_ns)
 {
+  apr_thread_mutex_t *rl, *wl;
+
+   //** Need to preserve the locks   
+   rl = dest_ns->read_lock; wl = dest_ns->write_lock;
+
    lock_ns(src_ns);
    memcpy(dest_ns, src_ns, sizeof(NetStream_t));
    unlock_ns(src_ns);
+
+   dest_ns->read_lock = rl; dest_ns->write_lock = wl;
 }
 
 //*********************************************************************
 // net_connect - Creates a connection to a remote host.
 //*********************************************************************
 
-int net_connect(NetStream_t *ns, char *hostname, int port, Net_timeout_t timeout)
+int net_connect(NetStream_t *ns, const char *hostname, int port, Net_timeout_t timeout)
 {
   int err;
 
@@ -282,47 +286,62 @@ int net_connect(NetStream_t *ns, char *hostname, int port, Net_timeout_t timeout
 //     incoming connection requests.
 //*********************************************************************
 
-void *monitor_thread(void *data)
+void *monitor_thread(apr_thread_t *th, void *data)
 {
    ns_monitor_t *nm = (ns_monitor_t *)data;
    NetStream_t *ns = nm->ns;
    int i;
 
-   pthread_mutex_lock(&(nm->lock));
+   log_printf(15, "monitor_thread: Monitoring port %d\n", nm->port);
+
+   apr_thread_mutex_lock(nm->lock);
    while (nm->shutdown_request == 0) {
-      pthread_mutex_unlock(&(nm->lock));
+      apr_thread_mutex_unlock(nm->lock);
 
       i = ns->connection_request(ns->sock, 1);
 
       if (i == 1) {  //** Got a request
-         log_printf(15, "monitor_thread: ns=%d Got a connection request time=" TT "\n", ns_getid(ns), time(NULL));
+         log_printf(15, "monitor_thread: port=%d ns=%d Got a connection request time=" TT "\n", nm->port, ns_getid(ns), time(NULL));
 
          //** Mark that I have a connection pending
-         pthread_mutex_lock(&(nm->lock)); 
+         apr_thread_mutex_lock(nm->lock); 
          nm->is_pending = 1;
-         pthread_mutex_unlock(&(nm->lock));
+         apr_thread_mutex_unlock(nm->lock);
 
          //** Wake up the calling thread
-         pthread_mutex_lock(nm->trigger_lock);
-//         *(nm->trigger_count)++;
-         pthread_cond_signal(nm->trigger_cond);
-         pthread_mutex_unlock(nm->trigger_lock);
+         apr_thread_mutex_lock(nm->trigger_lock);
+         *(nm->trigger_count) = 1;
+         apr_thread_cond_signal(nm->trigger_cond);
+         apr_thread_mutex_unlock(nm->trigger_lock);
+
+         log_printf(15, "monitor_thread: port=%d ns=%d waiting for accept\n", nm->port, ns_getid(ns));
+
 
          //** Sleep until my connection is accepted
-         pthread_mutex_lock(&(nm->lock)); 
-         pthread_cond_wait(&(nm->cond), &(nm->lock));
-         pthread_mutex_unlock(&(nm->lock));          
-         log_printf(15, "monitor_thread: ns=%d Connection accepted time=" TT "\n", ns_getid(ns), time(NULL));
+         apr_thread_mutex_lock(nm->lock); 
+         if (nm->is_pending == 1) {
+            apr_thread_cond_wait(nm->cond, nm->lock);
+         }
+         apr_thread_mutex_unlock(nm->lock);          
+         log_printf(15, "monitor_thread: port=%d ns=%d Connection accepted time=" TT "\n", nm->port, ns_getid(ns), time(NULL));
 
          //** Update pending count
-//         pthread_mutex_lock(nm->trigger_lock);
+//         apr_thread_mutex_lock(nm->trigger_lock);
 //         *(nm->trigger_count)--;
-//         pthread_mutex_unlock(nm->trigger_lock);
+//         apr_thread_mutex_unlock(nm->trigger_lock);
       } 
+
+      apr_thread_mutex_lock(nm->lock);
    }
+
+   apr_thread_mutex_unlock(nm->lock);
 
    //** Lastly shutdown my socket
    close_netstream(ns);
+
+   log_printf(15, "monitor_thread: Closing port %d\n", nm->port);
+
+   apr_thread_exit(th, 0);
 
    return(NULL);
 }
@@ -337,17 +356,20 @@ int bind_server_port(Network_t *net, NetStream_t *ns, char *address, int port, i
    int slot = net->used_ports;
    ns_monitor_t *nm = &(net->nm[slot]);
 
-   pthread_mutex_init(&(nm->lock), NULL);
-   pthread_cond_init(&(nm->cond), NULL);
+   log_printf(15, "bind_server_port: connection=%s:%d being stored in slot=%d\n", address, port, slot);
+   if (_net_pool == NULL) assert(apr_pool_create(&_net_pool, NULL) == APR_SUCCESS);
+   apr_thread_mutex_create(&(nm->lock), APR_THREAD_MUTEX_DEFAULT, _net_pool);
+   apr_thread_cond_create(&(nm->cond), _net_pool);
 
    nm->shutdown_request = 0;
    nm->is_pending = 0;
    nm->ns = ns;
    nm->address = strdup(address);
    nm->port = port;
-   nm->trigger_cond = &(net->cond);
-   nm->trigger_lock = &(net->ns_lock);
+   nm->trigger_cond = net->cond;
+   nm->trigger_lock = net->ns_lock;
    nm->trigger_count = &(net->accept_pending);
+   ns->id = ns_generate_id();
 
    err = ns->bind(ns->sock, address, port);
    if (err != 0) {
@@ -361,8 +383,8 @@ int bind_server_port(Network_t *net, NetStream_t *ns, char *address, int port, i
       return(err);
    }
 
-   
-   pthread_create(&(nm->thread), NULL, monitor_thread, (void *)nm);
+   apr_pool_create(&(nm->mpool), NULL);
+   apr_thread_create(&(nm->thread), NULL, monitor_thread, (void *)nm, nm->mpool);
 
    net->used_ports++;
    return(0);
@@ -374,21 +396,31 @@ int bind_server_port(Network_t *net, NetStream_t *ns, char *address, int port, i
 
 void close_server_port(ns_monitor_t *nm)
 {
-   void *dummy;
+   apr_status_t dummy;
 
    //** Trigger a port shutdown
-   pthread_mutex_lock(&(nm->lock));
+   apr_thread_mutex_lock(nm->lock);
    nm->shutdown_request = 1;
-   pthread_cond_signal(&(nm->cond));
-   pthread_mutex_unlock(&(nm->lock));
+log_printf(15, "close_server_port: port=%d Before cond_signal\n", nm->port); flush_log();
+   apr_thread_cond_signal(nm->cond);
+log_printf(15, "close_server_port: port=%d After cond_signal\n", nm->port); flush_log();
+   apr_thread_mutex_unlock(nm->lock);
+
+log_printf(15, "close_server_port: port=%d After unlock\n", nm->port); flush_log();
 
    //** Wait until the thread closes
-   pthread_join(nm->thread, &dummy);
+   apr_thread_join(&dummy, nm->thread);
+
+log_printf(15, "close_server_port: port=%d After join\n", nm->port); flush_log();
 
    //** Free the actual struct
    free(nm->address);
-   pthread_mutex_destroy(&(nm->lock));
-   pthread_cond_destroy(&(nm->cond));
+   apr_thread_mutex_destroy(nm->lock);
+   apr_thread_cond_destroy(nm->cond);
+
+   apr_pool_destroy(nm->mpool);
+
+   nm->port = -1;
 }
 
 
@@ -396,7 +428,7 @@ void close_server_port(ns_monitor_t *nm)
 // network_init - Initialize the network for use
 //*********************************************************************
 
-Network_t *network_init(char *address, int port, int max_pending)
+Network_t *network_init()
 {
   int i;
   Network_t *net;
@@ -404,13 +436,14 @@ Network_t *network_init(char *address, int port, int max_pending)
   //**** Allocate space for the data structures ***
   assert((net = (Network_t *)malloc(sizeof(Network_t))) != NULL);
 
-  net->address = strdup(address);
-  net->port = port;
-  net->cuid_counter = 0;
+  if (_net_pool == NULL) assert(apr_pool_create(&_net_pool, NULL) == APR_SUCCESS);
+
   net->used_ports = 0;
-  pthread_mutex_init(&(net->ns_lock), NULL);
-  pthread_mutex_unlock(&(net->ns_lock));
-  pthread_cond_init(&(net->cond), NULL);
+  net->trigger = 0;
+  net->accept_pending = 0;
+  net->monitor_index = 0;
+  apr_thread_mutex_create(&(net->ns_lock), APR_THREAD_MUTEX_DEFAULT,_net_pool);
+  apr_thread_cond_create(&(net->cond), _net_pool);
 
   net->used_ports = 0;
   for (i=0; i<NETWORK_MON_MAX; i++) {
@@ -460,8 +493,8 @@ void close_netstream(NetStream_t *ns)
 void teardown_netstream(NetStream_t *ns)
 {
   close_netstream(ns);
-  pthread_mutex_destroy(&(ns->read_lock));
-  pthread_mutex_destroy(&(ns->write_lock));
+  apr_thread_mutex_destroy(ns->read_lock);
+  apr_thread_mutex_destroy(ns->write_lock);
 }
 
 //********************************************************************* 
@@ -487,8 +520,12 @@ NetStream_t *new_netstream()
      abort();
   }
 
-  pthread_mutex_init(&(ns->read_lock), NULL);
-  pthread_mutex_init(&(ns->write_lock), NULL);
+  if (_net_pool == NULL) {      
+     assert(apr_pool_create(&_net_pool, NULL) == APR_SUCCESS);
+  }
+
+  apr_thread_mutex_create(&(ns->read_lock), APR_THREAD_MUTEX_DEFAULT,_net_pool);
+  apr_thread_mutex_create(&(ns->write_lock), APR_THREAD_MUTEX_DEFAULT,_net_pool);
  
   _ns_init(ns, 0);
   ns->id = ns->cuid = -1;
@@ -511,12 +548,20 @@ void network_close(Network_t *net)
          close_server_port(&(net->nm[i]));
       }
   }
+}
+
+//********************************************************************* 
+// network_destroy - Closes and destroys the network struct
+//********************************************************************* 
+
+void network_destroy(Network_t *net)
+{
+  network_close(net);
 
   //** Free the main net variables
-  pthread_mutex_destroy(&(net->ns_lock));   
-  pthread_cond_destroy(&(net->cond));   
+  apr_thread_mutex_destroy(net->ns_lock);   
+  apr_thread_cond_destroy(net->cond);   
   
-  free(net->address);
   free(net);
 }
 
@@ -592,6 +637,47 @@ NULL));
   }
 
   log_printf(15, "write_netstream_block: END ns=%d size=%d nleft=%d nbytes=%d pos=%d\n", ns_getid(ns), size, nleft, nbytes, pos);
+
+  return(err);
+}
+
+//********************************************************************* 
+//  read_netstream_block - Same as read_netstream but blocks until the
+//     data is sent or end_time is reached
+//********************************************************************* 
+
+int read_netstream_block(NetStream_t *ns, time_t end_time, char *buffer, int size)
+{
+  int pos, nleft, nbytes, err;
+ 
+  Net_timeout_t dt;
+
+  set_net_timeout(&dt, 1, 0);
+  pos = 0;
+  nleft = size;
+  nbytes = -100;
+  err = NS_OK;
+  while ((nleft > 0) && (err == NS_OK)) {
+     nbytes = read_netstream(ns, &(buffer[pos]), nleft, dt);
+     log_printf(15, "read_netstream_block: ns=%d size=%d nleft=%d nbytes=%d pos=%d time=" TT "\n", 
+             ns_getid(ns), size, nleft, nbytes, pos, time(NULL));
+
+     if (time(NULL) > end_time) {
+        log_printf(15, "read_netstream_block: ns=%d Command timed out! to=" TT " ct=" TT " \n", ns_getid(ns), end_time, time(
+NULL));
+        err = NS_TIMEOUT;
+     }
+
+     if (nbytes < 0) {
+        err = NS_SOCKET;   //** Error with write
+     } else if (nbytes > 0) {   //** Normal write
+        pos = pos + nbytes;
+        nleft = size - pos;
+        err = NS_OK;
+     }
+  }
+
+  log_printf(15, "read_netstream_block: END ns=%d size=%d nleft=%d nbytes=%d pos=%d\n", ns_getid(ns), size, nleft, nbytes, pos);
 
   return(err);
 }
@@ -735,21 +821,17 @@ int readline_netstream_raw(NetStream_t *ns, char *buffer, int bsize, Net_timeout
    //*** Now grab the data off the network port ****
    nbytes = 0;
    if (finished == 0) {
-      int loop = 0;
-      do {
-        loop++;
-        nbytes = read_netstream(ns, ns->buffer, N_BUFSIZE, timeout);  //**there should be 0 bytes in buffer now
-        debug_printf(15, "readline_netstream_raw: ns=%d Command : !", ns->id);
-        for (i=0; i< nbytes; i++) debug_printf(15, "%c", ns->buffer[i]);
-        debug_printf(15, "! * nbytes =%d\n", nbytes); flush_debug();
+      nbytes = read_netstream(ns, ns->buffer, N_BUFSIZE, timeout);  //**there should be 0 bytes in buffer now
+      debug_printf(15, "readline_netstream_raw: ns=%d Command : !", ns->id);
+      for (i=0; i< nbytes; i++) debug_printf(15, "%c", ns->buffer[i]);
+      debug_printf(15, "! * nbytes =%d\n", nbytes); flush_debug();
 
-        if (nbytes > 0) {
-           lock_read_ns(ns);
-           i = scan_and_copy_stream(ns->buffer, nbytes, &(buffer[total_bytes]), size-total_bytes, &finished);
-           unlock_read_ns(ns);
-           total_bytes += i;
-        }
-      } while ((finished == 0) && (total_bytes != size) && (nbytes != -1) && (loop < 1));
+      if (nbytes > 0) {
+         lock_read_ns(ns);
+         i = scan_and_copy_stream(ns->buffer, nbytes, &(buffer[total_bytes]), size-total_bytes, &finished);
+         unlock_read_ns(ns);
+         total_bytes += i;
+      }
    }
   
    buffer[total_bytes] = '\0';   //** Make sure and NULL terminate the string
@@ -774,6 +856,14 @@ int readline_netstream_raw(NetStream_t *ns, char *buffer, int bsize, Net_timeout
       return(0);
    } else {       //*** Not enough space in input buffer
       *status = 0;
+      lock_read_ns(ns);
+      ns->start = i;
+      ns->end = nbytes-1;
+      if (ns->start > ns->end) {
+         ns->start = 0;
+         ns->end = -1;
+      }
+      unlock_read_ns(ns);
       debug_printf(15, "readline_stream_raw: Out of buffer space or nothing read! ns=%d nbytes=%d  buffer=%s\n", ns->id, total_bytes, buffer); flush_debug();
 //      return(-1);   //**Force the socket to be closed
    }         
@@ -808,37 +898,49 @@ int readline_netstream(NetStream_t *ns, char *buffer, int bsize, Net_timeout_t t
 
 int accept_pending_connection(Network_t *net, NetStream_t *ns)
 {
-   int i, j, err;
+   int i, j, k, err;
    ns_monitor_t *nm = NULL;
 
    err = 0;
    //** Find the port
    j = -1;
+   k = net->monitor_index % net->used_ports;   
    for (i=0; i<net->used_ports; i++) {
-      nm = &(net->nm[i]);
-      pthread_mutex_lock(&(nm->lock));
+      k = (i + net->monitor_index) % net->used_ports;
+      nm = &(net->nm[k]);
+      apr_thread_mutex_lock(nm->lock);
       if (nm->is_pending == 1) {   //** Found a slot
-         j = i; 
+         j = k; 
          break;  
       }
-      pthread_mutex_unlock(&(nm->lock));
+      apr_thread_mutex_unlock(nm->lock);
    }
 
+   net->monitor_index = (k + 1) % net->used_ports;
+
    //** Check if there is nothing to do.
-   if (j > -1) {   
-       pthread_mutex_unlock(&(nm->lock));
+   if (j == -1) {   
        return(1);
    }
 
    ns_clone(ns, nm->ns);  //** Clone the settings
+   ns->nm = nm;           //** Specify the bind accepted
+
    ns->sock = nm->ns->accept(nm->ns->sock);   //** Accept the connection
    if (ns->sock == NULL) err = 1;
-   pthread_mutex_unlock(&(nm->lock));
-   
-   ns->id = ns_generate_id();
-   ns->set_peer(ns->sock, ns->peer_address, sizeof(ns->peer_address));
 
-   log_printf(10, "accept_pending_connection: Got a new connection from %s! Storing in ns=%d \n", ns->peer_address, ns->id);
+   nm->is_pending = 0;                  //** Clear the pending flag
+   apr_thread_cond_signal(nm->cond);    //** Wake up the pending monitor thread
+   apr_thread_mutex_unlock(nm->lock);   //** This was locked in the fop loop above
+
+   if (err == 0) {   
+      ns->id = ns_generate_id();
+      ns->set_peer(ns->sock, ns->peer_address, sizeof(ns->peer_address));
+
+      log_printf(10, "accept_pending_connection: Got a new connection from %s! Storing in ns=%d \n", ns->peer_address, ns->id);
+   } else {
+      log_printf(10, "accept_pending_connection: Failed getting a new connection\n");
+   }
 
    return(err);
 }
@@ -850,23 +952,28 @@ int accept_pending_connection(Network_t *net, NetStream_t *ns)
 
 int wait_for_connection(Network_t *net, int max_wait)
 {
-  struct timespec t;
+  apr_interval_time_t t;
   time_t end_time = time(NULL) + max_wait;
   int n;
 
-  pthread_mutex_lock(&(net->ns_lock));
+log_printf(15, "wait_for_connection: max_wait=%d starttime=" TT " endtime=" TT "\n", max_wait, time(NULL), end_time);
+  apr_thread_mutex_lock(net->ns_lock);
+
+log_printf(15, "wait_for_connection: accept_pending=%d trigger=%d\n", net->accept_pending, net->trigger);
  
   while ((end_time > time(NULL)) && (net->accept_pending == 0) && (net->trigger == 0)) {
-    t.tv_sec = time(NULL) + 1;    //wait for at least a second
-    t.tv_nsec = 0;
-    pthread_cond_timedwait(&(net->cond), &(net->ns_lock), &t);
+//    log_printf(15, "wait_for_connection: accept_pending=%d trigger=%d time=" TT "\n", net->accept_pending, net->trigger, time(NULL));
+    set_net_timeout(&t, 1, 0);  //** Wait for at least 1 second
+    apr_thread_cond_timedwait(net->cond, net->ns_lock, t);
   }   
+
+  log_printf(15, "wait_for_connection: exiting loop accept_pending=%d trigger=%d time=" TT "\n", net->accept_pending, net->trigger, time(NULL));
 
   net->trigger = 0;  //** Clear the trigger if it was set
   n = net->accept_pending;
   net->accept_pending--;
   if (net->accept_pending < 0) net->accept_pending = 0;
-  pthread_mutex_unlock(&(net->ns_lock));
+  apr_thread_mutex_unlock(net->ns_lock);
 
   return(n);  
 }
@@ -877,9 +984,9 @@ int wait_for_connection(Network_t *net, int max_wait)
 
 void wakeup_network(Network_t *net)
 {
-   pthread_mutex_lock(&(net->ns_lock));
+   apr_thread_mutex_lock(net->ns_lock);
    net->trigger = 1;
-   pthread_cond_signal(&(net->cond));
-   pthread_mutex_unlock(&(net->ns_lock));
+   apr_thread_cond_signal(net->cond);
+   apr_thread_mutex_unlock(net->ns_lock);
 }
 

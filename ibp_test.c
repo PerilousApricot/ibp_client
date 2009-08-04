@@ -350,6 +350,346 @@ void perform_user_rw_tests(ibp_depot_t *depot)
 }
 
 //*********************************************************************************
+// perform_splitmerge_tests - Tests the ability to split/merge allocations
+//*********************************************************************************
+
+void perform_splitmerge_tests(ibp_depot_t *depot)
+{
+  int bufsize = 2048;
+  char wbuf[bufsize+1], rbuf[bufsize+1];
+  ibp_op_t op;
+  ibp_attributes_t attr;
+  ibp_capset_t mcaps, caps, caps2;
+  ibp_capstatus_t probe;
+  int nbytes, err, max_size, curr_size, dummy;
+  ibp_timer_t timer;
+
+  printf("perform_splitmerge_tests:  Starting tests!\n");
+
+  set_ibp_timer(&timer, ibp_timeout, ibp_timeout);
+
+  //** Initialize the buffers **
+  memset(wbuf, '0', sizeof(wbuf));  wbuf[1023]='1'; wbuf[1024]='2'; wbuf[bufsize] = '\0';
+  memset(rbuf, 0, sizeof(rbuf));
+  nbytes = 1024;
+
+  //*** Make the allocation used in the tests ***
+  set_ibp_attributes(&attr, time(NULL) + A_DURATION, IBP_HARD, IBP_BYTEARRAY);
+  set_ibp_alloc_op(&op, &mcaps, bufsize, depot, &attr, ibp_timeout, NULL, NULL);
+  err = ibp_sync_command(&op);
+  if (err != IBP_OK) {
+     failed_tests++;
+     printf("perform_splitmerge_tests:  Error creating initial allocation for tests!! error=%d\n", err);
+     return;
+  }
+
+  //** Fill the master with data **
+  err = IBP_store(get_ibp_cap(&mcaps, IBP_WRITECAP), &timer, wbuf, bufsize);
+  if (err != bufsize) {
+     failed_tests++;
+     printf("perform_splitmerge_tests: Error with master IBP_store! wrote=%d err=%d\n", err, IBP_errno);
+  }    
+
+  //** Split the allocation
+  set_ibp_split_alloc_op(&op, get_ibp_cap(&mcaps, IBP_MANAGECAP), &caps, 1024, &attr, ibp_timeout, NULL, NULL);
+  err = ibp_sync_command(&op);
+  if (err != IBP_OK) {
+     failed_tests++;
+     printf("perform_splitmerge_tests:  Error creating child allocation for tests!! error=%d\n", err);
+     return;
+  }
+  
+  //** Check the new size of the master
+  set_ibp_probe_op(&op, get_ibp_cap(&mcaps, IBP_MANAGECAP), &probe, ibp_timeout, NULL, NULL);
+  err = ibp_sync_command(&op);
+  if (err != IBP_OK) {
+     failed_tests++;
+     printf("perform_splitmerge_tests:  Error probing master allocation for tests!! error=%d\n", err);
+     return;
+  }
+
+  get_ibp_capstatus(&probe, &dummy, &dummy, &curr_size, &max_size, &attr);
+  if ((curr_size != 1024) && (max_size != 1024)) {
+     failed_tests++;
+     printf("perform_splitmerge_tests:  Error with master allocation size!! curr_size=%d * max_size=%d should both be 1024\n", curr_size, max_size);
+     return;
+  }   
+
+  //** Check the size of the child allocation
+  set_ibp_probe_op(&op, get_ibp_cap(&caps, IBP_MANAGECAP), &probe, ibp_timeout, NULL, NULL);
+  err = ibp_sync_command(&op);
+  if (err != IBP_OK) {
+     failed_tests++;
+     printf("perform_splitmerge_tests:  Error probing child allocation for tests!! error=%d\n", err);
+     return;
+  }
+
+  get_ibp_capstatus(&probe, &dummy, &dummy, &curr_size, &max_size, &attr); 
+  if ((curr_size != 0) && (max_size != 1024)) {
+     failed_tests++;
+     printf("perform_splitmerge_tests:  Error with master allocation size!! curr_size=%d * max_size=%d should be 0 and 1024\n", curr_size, max_size);
+     return;
+  }   
+
+  //** Verify the master data
+  wbuf[1024] = '\0';
+  err = IBP_load(get_ibp_cap(&mcaps, IBP_READCAP), &timer, rbuf, 1024, 0);
+  if (err == 1024) {
+     if (strcmp(rbuf, wbuf) != 0) {
+        failed_tests++;
+        printf("Read some data with the mastercap but it wasn't correct!\n");
+        printf("Original=%s\n", wbuf);
+        printf("     Got=%s\n", rbuf);
+     }
+  } else {
+     failed_tests++;
+     printf("Oops! Failed reading master cap! err=%d\n", err);
+  }
+
+  //** Load data into the child
+  err = IBP_store(get_ibp_cap(&caps, IBP_WRITECAP), &timer, wbuf, 1024);
+  if (err != 1024) {
+     failed_tests++;
+     printf("perform_splitmerge_tests: Error with child IBP_store! wrote=%d err=%d\n", err, IBP_errno);
+  }    
+
+  //** Read it back
+  memset(rbuf, 0, sizeof(rbuf));
+  err = IBP_load(get_ibp_cap(&caps, IBP_READCAP), &timer, rbuf, 1024, 0);
+  if (err == 1024) {
+     if (strcmp(rbuf, wbuf) != 0) {
+        failed_tests++;
+        printf("Read some data with the childcap but it wasn't correct!\n");
+        printf("Original=%s\n", wbuf);
+        printf("     Got=%s\n", rbuf);
+     }
+  } else {
+     failed_tests++;
+     printf("Oops! Failed reading child cap! err=%d\n", err);
+  }
+
+  //** Split the master again but htis time make it to big so it should fail
+  set_ibp_split_alloc_op(&op, get_ibp_cap(&mcaps, IBP_MANAGECAP), &caps2, 2048, &attr, ibp_timeout, NULL, NULL);
+  err = ibp_sync_command(&op);
+  if (err == IBP_OK) {
+     failed_tests++;
+     printf("perform_splitmerge_tests:  Error created child allocation when I shouldn't have! error=%d\n", err);
+     return;
+  }
+
+  //** Check the size of the master to make sure it didn't change
+  set_ibp_probe_op(&op, get_ibp_cap(&mcaps, IBP_MANAGECAP), &probe, ibp_timeout, NULL, NULL);
+  err = ibp_sync_command(&op);
+  if (err != IBP_OK) {
+     failed_tests++;
+     printf("perform_splitmerge_tests:  Error probing master allocation2 for tests!! error=%d\n", err);
+     return;
+  }
+
+  get_ibp_capstatus(&probe, &dummy, &dummy, &curr_size, &max_size, &attr);
+  if ((curr_size != 1024) && (max_size != 1024)) {
+     failed_tests++;
+     printf("perform_splitmerge_tests:  Error with master allocation size2!! curr_size=%d * max_size=%d should both be 1024\n", curr_size, max_size);
+     return;
+  }   
+
+//GOOD!!!!!!!!!!!!!!!!!
+
+  //** Merge the 2 allocations
+  set_ibp_merge_alloc_op(&op, get_ibp_cap(&mcaps, IBP_MANAGECAP), get_ibp_cap(&caps, IBP_MANAGECAP), ibp_timeout, NULL, NULL);
+  err = ibp_sync_command(&op);
+  if (err != IBP_OK) {
+     failed_tests++;
+     printf("perform_splitmerge_tests:  Error with merge! error=%d\n", err);
+     return;
+  }
+
+  //** Verify the child is gone
+  set_ibp_probe_op(&op, get_ibp_cap(&caps, IBP_MANAGECAP), &probe, ibp_timeout, NULL, NULL);
+  err = ibp_sync_command(&op);
+  if (err == IBP_OK) {
+     failed_tests++;
+     printf("perform_splitmerge_tests:  Oops!  Child allocation is available after merge! ccap=%s\n", get_ibp_cap(&caps, IBP_MANAGECAP));
+     return;
+  }
+
+
+  //** Verify the max/curr size of the master
+  set_ibp_probe_op(&op, get_ibp_cap(&mcaps, IBP_MANAGECAP), &probe, ibp_timeout, NULL, NULL);
+  err = ibp_sync_command(&op);
+  if (err != IBP_OK) {
+     failed_tests++;
+     printf("perform_splitmerge_tests:  Error with probe of mcapafter mergs! ccap=%s err=%d\n", get_ibp_cap(&mcaps, IBP_MANAGECAP), err);
+     return;
+  }
+
+//GOOD!!!!!!!!!!!!!!!!!
+
+  get_ibp_capstatus(&probe, &dummy, &dummy, &curr_size, &max_size, &attr);
+  if ((curr_size != 1024) && (max_size != 2048)) {
+     failed_tests++;
+     printf("perform_splitmerge_tests:  Error with master allocation size after merge!! curr_size=%d * max_size=%d should both 1024 and 2048\n", curr_size, max_size);
+     return;
+  }   
+
+  //** Lastly Remove the master allocation **
+  set_ibp_remove_op(&op, get_ibp_cap(&mcaps, IBP_MANAGECAP), ibp_timeout, NULL, NULL);
+  err = ibp_sync_command(&op);
+  if (err != IBP_OK) {
+     printf("perform_splitmerge_tests: Error removing master allocation!  ibp_errno=%d\n", err);
+  }
+
+  printf("perform_splitmerge_tests:  Passed!\n");
+}
+
+//*********************************************************************************
+// perform_pushpull_tests - Tests the ability to perform push/pull copy operations
+//*********************************************************************************
+
+void perform_pushpull_tests(ibp_depot_t *depot1, ibp_depot_t *depot2)
+{
+  int bufsize = 2048;
+  char wbuf[bufsize+1], rbuf[bufsize+1];
+  ibp_op_t op;
+  ibp_attributes_t attr;
+  ibp_capset_t caps1, caps2;
+  int nbytes, err;
+  ibp_timer_t timer;
+  int start_nfailed = failed_tests;
+
+  printf("perform_pushpull_tests:  Starting tests!\n");
+
+  set_ibp_timer(&timer, ibp_timeout, ibp_timeout);
+
+  //** Initialize the buffers **
+  memset(wbuf, '0', sizeof(wbuf));  wbuf[1023]='1'; wbuf[1024]='2'; wbuf[bufsize] = '\0';
+  memset(rbuf, 0, sizeof(rbuf));
+  nbytes = 1024;
+
+  //*** Make the allocation used in the tests ***
+  set_ibp_attributes(&attr, time(NULL) + A_DURATION, IBP_HARD, IBP_BYTEARRAY);
+  set_ibp_alloc_op(&op, &caps1, bufsize, depot1, &attr, ibp_timeout, NULL, NULL);
+  err = ibp_sync_command(&op);
+  if (err != IBP_OK) {
+     failed_tests++;
+     printf("perform_pushpull_tests: Oops! Error creating allocation 1 for tests!! error=%d\n", err);
+     return;
+  }
+
+  set_ibp_alloc_op(&op, &caps2, bufsize, depot2, &attr, ibp_timeout, NULL, NULL);
+  err = ibp_sync_command(&op);
+  if (err != IBP_OK) {
+     failed_tests++;
+     printf("perform_pushpull_tests: Oops! Error creating allocation 2 for tests!! error=%d\n", err);
+     return;
+  }
+
+  //** Fill caps1="1" with data **
+  err = IBP_store(get_ibp_cap(&caps1, IBP_WRITECAP), &timer, "1", 1);
+  if (err != 1) {
+     failed_tests++;
+     printf("perform_pushpull_tests: Oops! Error with master IBP_store! wrote=%d err=%d\n", err, IBP_errno);
+  }    
+
+  //** Append it to cap2="1"
+  set_ibp_copy_op(&op, IBP_PUSH, NS_TYPE_SOCK, NULL, get_ibp_cap(&caps1, IBP_READCAP), 
+          get_ibp_cap(&caps2, IBP_WRITECAP), 0, -1, 1, ibp_timeout, ibp_timeout, ibp_timeout, NULL, NULL);
+  err = ibp_sync_command(&op);
+  if (err != IBP_OK) {
+     failed_tests++;
+     printf("perform_pushpull_tests: Oops! Error with copy 1!! error=%d\n", err);
+     return;
+  }
+
+  //** Append cap2 to cap1="11"
+  set_ibp_copy_op(&op, IBP_PULL, NS_TYPE_SOCK, NULL, get_ibp_cap(&caps1, IBP_WRITECAP), 
+          get_ibp_cap(&caps2, IBP_READCAP), -1, 0, 1, ibp_timeout, ibp_timeout, ibp_timeout, NULL, NULL);
+  err = ibp_sync_command(&op);
+  if (err != IBP_OK) {
+     failed_tests++;
+     printf("perform_pushpull_tests: Oops! Error with copy 2!! error=%d\n", err);
+     return;
+  }
+
+  //** Append it to cap2="111"
+  set_ibp_copy_op(&op, IBP_PUSH, NS_TYPE_SOCK, NULL, get_ibp_cap(&caps1, IBP_READCAP), 
+          get_ibp_cap(&caps2, IBP_WRITECAP), 0, -1, 2, ibp_timeout, ibp_timeout, ibp_timeout, NULL, NULL);
+  err = ibp_sync_command(&op);
+  if (err != IBP_OK) {
+     failed_tests++;
+     printf("perform_pushpull_tests: Oops! Error with copy 3!! error=%d\n", err);
+     return;
+  }
+
+  //** Change  caps1="123"
+  err = IBP_write(get_ibp_cap(&caps1, IBP_WRITECAP), &timer, "23", 2, 1);
+  if (err != 2) {
+     failed_tests++;
+     printf("perform_pushpull_tests: Oops! Error with IBP_store 2! wrote=%d err=%d\n", err, IBP_errno);
+  }    
+
+  //** offset it to also make cap2="123"
+  set_ibp_copy_op(&op, IBP_PUSH, NS_TYPE_SOCK, NULL, get_ibp_cap(&caps1, IBP_READCAP), 
+          get_ibp_cap(&caps2, IBP_WRITECAP), 1, 1, 2, ibp_timeout, ibp_timeout, ibp_timeout, NULL, NULL);
+  err = ibp_sync_command(&op);
+  if (err != IBP_OK) {
+     failed_tests++;
+     printf("perform_pushpull_tests: Oops! Error with copy 4!! error=%d\n", err);
+     return;
+  }
+
+  //** Now read them back and check them
+  //** verify caps1
+  memset(rbuf, 0, sizeof(rbuf));
+  memcpy(wbuf, "123", 4);
+  err = IBP_load(get_ibp_cap(&caps1, IBP_READCAP), &timer, rbuf, 3, 0);
+  if (err == 3) {
+     if (strcmp(rbuf, wbuf) != 0) {
+        failed_tests++;
+        printf("perform_pushpull_tests: Read some data with the cap1 but it wasn't correct!\n");
+        printf("perform_pushpull_tests: Original=%s\n", wbuf);
+        printf("perform_pushpull_tests:      Got=%s\n", rbuf);
+     }
+  } else {
+     failed_tests++;
+     printf("perform_pushpull_tests: Oops! Failed reading cap1! err=%d\n", err);
+  }
+
+  //** and also caps2
+  memset(rbuf, 0, sizeof(rbuf));
+  err = IBP_load(get_ibp_cap(&caps2, IBP_READCAP), &timer, rbuf, 3, 0);
+  if (err == 3) {
+     if (strcmp(rbuf, wbuf) != 0) {
+        failed_tests++;
+        printf("perform_pushpull_tests: Read some data with the cap2 but it wasn't correct!\n");
+        printf("perform_pushpull_tests: Original=%s\n", wbuf);
+        printf("perform_pushpull_tests:      Got=%s\n", rbuf);
+     }
+  } else {
+     failed_tests++;
+     printf("perform_pushpull_tests: Oops! Failed reading cap2! err=%d\n", err);
+  }
+
+  //** Lastly Remove the allocations **
+  set_ibp_remove_op(&op, get_ibp_cap(&caps1, IBP_MANAGECAP), ibp_timeout, NULL, NULL);
+  err = ibp_sync_command(&op);
+  if (err != IBP_OK) {
+     printf("perform_pushpull_tests: Oops! Error removing allocation 1!  ibp_errno=%d\n", err);
+  }
+  set_ibp_remove_op(&op, get_ibp_cap(&caps2, IBP_MANAGECAP), ibp_timeout, NULL, NULL);
+  err = ibp_sync_command(&op);
+  if (err != IBP_OK) {
+     printf("perform_pushpull_tests: Oops! Error removing allocation 2!  ibp_errno=%d\n", err);
+  }
+
+  if (start_nfailed == failed_tests) {
+     printf("perform_pushpull_tests: Passed!\n");
+  } else {
+     printf("perform_pushpull_tests: Oops! FAILED!\n");
+  }
+}
+
+//*********************************************************************************
 //*********************************************************************************
 //*********************************************************************************
 
@@ -362,7 +702,7 @@ int main(int argc, char **argv)
   ibp_capset_t *caps, *caps2, *caps4;
   ibp_capset_t caps3, caps5;
   ibp_capstatus_t astat;
-  ibp_proxy_capstatus_t proxy_stat;
+  ibp_alias_capstatus_t alias_stat;
   int err, i, len, offset;
   int bufsize = 1024*1024;
   char wbuf[bufsize];
@@ -420,7 +760,7 @@ int main(int argc, char **argv)
   set_ibp_attributes(&attr, time(NULL) + 60, IBP_HARD, IBP_BYTEARRAY); 
   set_ibp_timer(&timer, ibp_timeout, ibp_timeout);
 
-printf("Before allocate\n"); fflush(stdout);
+//printf("Before allocate\n"); fflush(stdout);
 
   //*** Perform single allocation
   caps = IBP_allocate(&depot1, &timer, bufsize, &attr);
@@ -565,7 +905,6 @@ printf("Before allocate\n"); fflush(stdout);
   }
   destroy_ibp_capset(caps4); caps4 = NULL;
 
-
   printf("ibp_manage(IBP_DECR):-Removing allocations----------------------------------\n");
   err = IBP_manage(get_ibp_cap(caps, IBP_MANAGECAP), &timer, IBP_DECR, IBP_READCAP, &astat);
   if (err != 0) { failed_tests++; printf("ibp_manage(decr) for caps1 error = %d * ibp_errno=%d\n", err, IBP_errno); }
@@ -576,8 +915,8 @@ printf("Before allocate\n"); fflush(stdout);
   depotinfo = IBP_status(&depot1, IBP_ST_INQ, &timer, "ibp", 10,11,12);
   if (depotinfo != NULL) {
      printf("rid=%d * duration=%ld\n", depotinfo->rid, depotinfo->Duration);
-     printf("hc=%lld   hs=%lld ha=%lld\n",depotinfo->HardConfigured, depotinfo->HardServed, depotinfo->HardAllocable);
-     printf("tc=%lld  ts=%lld tu=%lld\n", depotinfo->TotalConfigured, depotinfo->TotalServed, depotinfo->TotalUsed);
+     printf("hc=" LL " hs=" LL " ha=" LL "\n",depotinfo->HardConfigured, depotinfo->HardServed, depotinfo->HardAllocable);
+     printf("tc=" LL " ts=" LL " tu=" LL "\n", depotinfo->TotalConfigured, depotinfo->TotalServed, depotinfo->TotalUsed);
   } else {
      failed_tests++;
      printf("ibp_status error=%d\n", IBP_errno);
@@ -690,9 +1029,10 @@ printf("Before allocate\n"); fflush(stdout);
   printf("Completed ibp_rename test...........................\n");
 
   //-----------------------------------------------------------------------------------------------------
-  //** check ibp_proxy_allocate/manage ****
+  //** check ibp_alias_allocate/manage ****
 
-  printf("Testing IBP_PROXY_ALLOCATE/MANAGE...............................................\n");
+//**** GOOD
+  printf("Testing IBP_alias_ALLOCATE/MANAGE...............................................\n");
   caps = IBP_allocate(&depot1, &timer, bufsize, &attr);
   if (caps == NULL) {
      failed_tests++;
@@ -705,17 +1045,18 @@ printf("Before allocate\n"); fflush(stdout);
      printf("Manage: %s\n", caps->manageCap);
   }  
 
-  set_ibp_proxy_alloc_op(&op, caps2, get_ibp_cap(caps, IBP_MANAGECAP), 0, 0, 0, ibp_timeout, NULL, NULL);
+  set_ibp_alias_alloc_op(&op, caps2, get_ibp_cap(caps, IBP_MANAGECAP), 0, 0, 0, ibp_timeout, NULL, NULL);
   err = ibp_sync_command(&op);
   if (err != IBP_OK) {
      failed_tests++;
-     printf("Error with ibp_proxy_alloc. err=%d\n", err);
+     printf("Error with ibp_alias_alloc. err=%d\n", err);
   } else {
-     printf("Proxy Cap..............\n");
+     printf("Alias Cap..............\n");
      printf("Read: %s\n", caps2->readCap);
      printf("Write: %s\n", caps2->writeCap);
      printf("Manage: %s\n", caps2->manageCap);
   }  
+
 
   err = IBP_manage(get_ibp_cap(caps, IBP_MANAGECAP), &timer, IBP_PROBE, 0, &astat);
   if (err == 0) {
@@ -734,7 +1075,7 @@ printf("Before allocate\n"); fflush(stdout);
 
   err = IBP_manage(get_ibp_cap(caps2, IBP_MANAGECAP), &timer, IBP_PROBE, 0, &astat);
   if (err == 0) {
-     printf("Using proxy to get actual cap info\n");
+     printf("Using alias to get actual cap info\n");
      printf(" read count = %d\n", astat.readRefCount);
      printf(" write count = %d\n", astat.writeRefCount);
      printf(" current size = %d\n", astat.currentSize);
@@ -746,28 +1087,28 @@ printf("Before allocate\n"); fflush(stdout);
      failed_tests++;
      printf("ibp_manage error = %d * ibp_errno=%d\n", err, IBP_errno);
   }
-  
-  set_ibp_proxy_probe_op(&op, get_ibp_cap(caps2, IBP_MANAGECAP), &proxy_stat, ibp_timeout, NULL, NULL);
+
+  set_ibp_alias_probe_op(&op, get_ibp_cap(caps2, IBP_MANAGECAP), &alias_stat, ibp_timeout, NULL, NULL);
   err = ibp_sync_command(&op);
   if (err != IBP_OK) {
      failed_tests++;
-     printf("Error with ibp_proxy_probe. err=%d\n", err);
+     printf("Error with ibp_alias_probe. err=%d\n", err);
   } else {
-     printf("Proxy stat..............\n");
-     printf(" read count = %d\n", proxy_stat.read_refcount);
-     printf(" write count = %d\n", proxy_stat.write_refcount);
-     printf(" offset = " ST "\n", proxy_stat.offset);
-     printf(" size = " ST "\n", proxy_stat.size);
-     printf(" duration = %lu\n", proxy_stat.duration - time(NULL));
+     printf("Alias stat..............\n");
+     printf(" read count = %d\n", alias_stat.read_refcount);
+     printf(" write count = %d\n", alias_stat.write_refcount);
+     printf(" offset = " ST "\n", alias_stat.offset);
+     printf(" size = " ST "\n", alias_stat.size);
+     printf(" duration = %lu\n", alias_stat.duration - time(NULL));
   }
 
-  set_ibp_proxy_alloc_op(&op, &caps3, get_ibp_cap(caps, IBP_MANAGECAP), 10, 40, 0, ibp_timeout, NULL, NULL);
+  set_ibp_alias_alloc_op(&op, &caps3, get_ibp_cap(caps, IBP_MANAGECAP), 10, 40, 0, ibp_timeout, NULL, NULL);
   err = ibp_sync_command(&op);
   if (err != IBP_OK) {
      failed_tests++;
-     printf("Error with ibp_proxy_alloc_op. err=%d\n", err);
+     printf("Error with ibp_alias_alloc_op. err=%d\n", err);
   } else {
-     printf("Proxy Cap with range 10-50.............\n");
+     printf("Alias Cap with range 10-50.............\n");
      printf("Read: %s\n", caps3.readCap);
      printf("Write: %s\n", caps3.writeCap);
      printf("Manage: %s\n", caps3.manageCap);
@@ -775,7 +1116,7 @@ printf("Before allocate\n"); fflush(stdout);
 
   err = IBP_manage(get_ibp_cap(&caps3, IBP_MANAGECAP), &timer, IBP_PROBE, 0, &astat);
   if (err == 0) {
-     printf("Using limited proxy to get actual cap info\n");
+     printf("Using limited alias to get actual cap info\n");
      printf(" read count = %d\n", astat.readRefCount);
      printf(" write count = %d\n", astat.writeRefCount);
      printf(" current size = %d\n", astat.currentSize);
@@ -788,7 +1129,7 @@ printf("Before allocate\n"); fflush(stdout);
      printf("ibp_manage error = %d * ibp_errno=%d\n", err, IBP_errno);
   }
 
-  printf("*append* using the full proxy..................................\n");
+  printf("*append* using the full alias..................................\n");
   for (i=0; i<bufsize; i++) wbuf[i] = '0';
   err = IBP_store(get_ibp_cap(caps2, IBP_WRITECAP), &timer, wbuf, bufsize);
   if (err != bufsize) {
@@ -796,7 +1137,7 @@ printf("Before allocate\n"); fflush(stdout);
      printf("Error with IBP_store! wrote=%d err=%d\n", err, IBP_errno);
   }    
 
-  printf("write using the limited proxy..................................\n");  
+  printf("write using the limited alias..................................\n");  
   data = "This is a test.";
   len = strlen(data)+1;
   err = IBP_write(get_ibp_cap(&caps3, IBP_WRITECAP), &timer, data, len, 0);
@@ -810,7 +1151,7 @@ printf("Before allocate\n"); fflush(stdout);
   err = IBP_load(get_ibp_cap(caps2, IBP_READCAP), &timer, rbuf, len, 0);
   if (err == len) {
      if (strcmp(rbuf, wbuf) == 0) {
-        printf("Read using the new full proxy the original data!\n");
+        printf("Read using the new full alias the original data!\n");
         printf("  read=%s\n", rbuf);       
      } else {
         failed_tests++;
@@ -823,8 +1164,9 @@ printf("Before allocate\n"); fflush(stdout);
      printf("Oops! Failed reading with new cap! err=%d\n", err);
   }
 
+
   //** Try to R/W beyond the end of the limited cap **
-  printf("attempting to R/W beyond the end of the limited proxy......\n");
+  printf("attempting to R/W beyond the end of the limited alias......\n");
   data = "This is a test.";
   len = strlen(data)+1;
   err = IBP_write(get_ibp_cap(&caps3, IBP_WRITECAP), &timer, data, len, 35);
@@ -832,7 +1174,7 @@ printf("Before allocate\n"); fflush(stdout);
      printf("Correctly got an IBP_Write error! wrote=%d err=%d\n", err, IBP_errno);
   } else {
      failed_tests++;
-     printf("Oops! Was able to write boyond the end of the limited cap with new cap!\n");
+     printf("Oops! Was able to write beyond the end of the limited cap with new cap!\n");
   }
 
   err = IBP_load(get_ibp_cap(&caps3, IBP_READCAP), &timer, rbuf, len, 35);
@@ -840,15 +1182,15 @@ printf("Before allocate\n"); fflush(stdout);
      printf("Correctly got an IBP_read error! wrote=%d err=%d\n", err, IBP_errno);
   } else {
      failed_tests++;
-     printf("Oops! Was able to write beyond the end of the limited cap with new cap!\n");
+     printf("Oops! Was able to read beyond the end of the limited cap with new cap!\n");
   }
 
-  //** Perform a proxy->proxy copy.  The src proxy is restricted
-  printf("Testing restricted proxy->full proxy depot-depot copy\n");
+  //** Perform a alias->alias copy.  The src alias is restricted
+  printf("Testing restricted alias->full alias depot-depot copy\n");
   caps4 = IBP_allocate(&depot1, &timer, bufsize, &attr);
   if (caps == NULL) {
      failed_tests++;
-     printf("proxy-proxy allocate Error!!!! ibp_errno = %d\n", IBP_errno);
+     printf("alias-alias allocate Error!!!! ibp_errno = %d\n", IBP_errno);
      return(1);
   } else {
      printf("Depot-Depot copy OriginalDestiniation Cap..............\n");
@@ -857,18 +1199,19 @@ printf("Before allocate\n"); fflush(stdout);
      printf("Manage: %s\n", caps4->manageCap);
   }  
 
-  set_ibp_proxy_alloc_op(&op, &caps5, get_ibp_cap(caps4, IBP_MANAGECAP), 0, 0, 0, ibp_timeout, NULL, NULL);
+  set_ibp_alias_alloc_op(&op, &caps5, get_ibp_cap(caps4, IBP_MANAGECAP), 0, 0, 0, ibp_timeout, NULL, NULL);
   err = ibp_sync_command(&op);
   if (err != IBP_OK) {
      failed_tests++;
-     printf("Error with ibp_proxy_alloc_op. err=%d\n", err);
+     printf("Error with ibp_alias_alloc_op. err=%d\n", err);
   } else {
-     printf("Destination Proxy Cap with full range.............\n");
+     printf("Destination Alias Cap with full range.............\n");
      printf("Read: %s\n", caps5.readCap);
      printf("Write: %s\n", caps5.writeCap);
      printf("Manage: %s\n", caps5.manageCap);
   }  
 
+//BAD!!!!!!!!!!!
   //** Perform the copy
   data = "This is a test.";
   len = strlen(data)+1;
@@ -879,7 +1222,7 @@ printf("Before allocate\n"); fflush(stdout);
   err = IBP_load(get_ibp_cap(&caps5, IBP_READCAP), &timer, rbuf, len, 0);
   if (err == len) {
      if (strcmp(rbuf, data) == 0) {
-        printf("Read using the new full proxy the original data!\n");
+        printf("Read using the new full alias the original data!\n");
         printf("  read=%s\n", rbuf);       
      } else {
         failed_tests++;
@@ -892,12 +1235,12 @@ printf("Before allocate\n"); fflush(stdout);
      printf("Oops! Failed reading with new cap! err=%d\n", err);
   }
 
-  //** Remove the cap5 (full proxy)
-  set_ibp_proxy_remove_op(&op, get_ibp_cap(&caps5, IBP_MANAGECAP), get_ibp_cap(caps4, IBP_MANAGECAP), ibp_timeout, NULL, NULL);
+  //** Remove the cap5 (full alias)
+  set_ibp_alias_remove_op(&op, get_ibp_cap(&caps5, IBP_MANAGECAP), get_ibp_cap(caps4, IBP_MANAGECAP), ibp_timeout, NULL, NULL);
   err = ibp_sync_command(&op);
   if (err != IBP_OK) {
      failed_tests++;
-     printf("Error dest deleting proxy cap error = %d\n", err); 
+     printf("Error dest deleting alias cap error = %d\n", err); 
   }
 
   //** Remove the dest cap
@@ -907,27 +1250,27 @@ printf("Before allocate\n"); fflush(stdout);
      printf("Error deleting dest caps error = %d * ibp_errno=%d\n", err, IBP_errno); 
   }
 
-  printf("completed proxy depot->depot copy test\n");
+  printf("completed alias depot->depot copy test\n");
 
-  //** Try to remove the cap2 (full proxy) with a bad cap
-  set_ibp_proxy_remove_op(&op, get_ibp_cap(caps2, IBP_MANAGECAP), get_ibp_cap(&caps3, IBP_MANAGECAP), ibp_timeout, NULL, NULL);
+  //** Try to remove the cap2 (full alias) with a bad cap
+  set_ibp_alias_remove_op(&op, get_ibp_cap(caps2, IBP_MANAGECAP), get_ibp_cap(&caps3, IBP_MANAGECAP), ibp_timeout, NULL, NULL);
   err = ibp_sync_command(&op);
   if (err != IBP_OK) {
-     printf("Correctly detected error deleting proxy cap with an invalid master cap error = %d\n", err); 
+     printf("Correctly detected error deleting alias cap with an invalid master cap error = %d\n", err); 
   } else {
      failed_tests++;
-     printf("Oops! Was able to delete the proxy with an invalid master cap!!!!!!!!\n");
+     printf("Oops! Was able to delete the alias with an invalid master cap!!!!!!!!\n");
   }
 
-  //** Remove the cap2 (full proxy)
-  set_ibp_proxy_remove_op(&op, get_ibp_cap(caps2, IBP_MANAGECAP), get_ibp_cap(caps, IBP_MANAGECAP), ibp_timeout, NULL, NULL);
+  //** Remove the cap2 (full alias)
+  set_ibp_alias_remove_op(&op, get_ibp_cap(caps2, IBP_MANAGECAP), get_ibp_cap(caps, IBP_MANAGECAP), ibp_timeout, NULL, NULL);
   err = ibp_sync_command(&op);
   if (err != IBP_OK) {
      failed_tests++;
-     printf("Error deleting proxy cap error = %d\n", err); 
+     printf("Error deleting alias cap error = %d\n", err); 
   }
 
-  printf("Try to read the deleted full fproxy.  This should generate an error\n");
+  printf("Try to read the deleted full falias.  This should generate an error\n");
   err = IBP_load(get_ibp_cap(caps2, IBP_READCAP), &timer, rbuf, len, 35);
   if (err != len) {
      printf("Correctly got an IBP_read error! wrote=%d err=%d\n", err, IBP_errno);
@@ -936,12 +1279,12 @@ printf("Before allocate\n"); fflush(stdout);
      printf("Oops! Was able to write beyond the end of the limited cap with new cap!\n");
   }
 
-  //** Remove the limited proxy (cap3)
-  set_ibp_proxy_remove_op(&op, get_ibp_cap(&caps3, IBP_MANAGECAP), get_ibp_cap(caps, IBP_MANAGECAP), ibp_timeout, NULL, NULL);
+  //** Remove the limited alias (cap3)
+  set_ibp_alias_remove_op(&op, get_ibp_cap(&caps3, IBP_MANAGECAP), get_ibp_cap(caps, IBP_MANAGECAP), ibp_timeout, NULL, NULL);
   err = ibp_sync_command(&op);
   if (err != IBP_OK) {
      failed_tests++;
-     printf("Error deleting the limited proxy cap  error = %d\n", err); 
+     printf("Error deleting the limited alias cap  error = %d\n", err); 
   }
 
   //** Remove the original cap
@@ -950,8 +1293,13 @@ printf("Before allocate\n"); fflush(stdout);
      failed_tests++;
      printf("Error deleting original caps error = %d * ibp_errno=%d\n", err, IBP_errno); 
   }
-  
-  printf("finished testing IBP_PROXY_ALLOCATE/MANAGE...............................................\n");
+
+//GOOD!!!!!!!!!!!!!!!!!!!!
+
+  printf("finished testing IBP_alias_ALLOCATE/MANAGE...............................................\n");
+
+  perform_splitmerge_tests(&depot1);
+  perform_pushpull_tests(&depot1, &depot2);
 
   printf("\n\n");
   printf("Final network connection counter: %d\n", network_counter(NULL));

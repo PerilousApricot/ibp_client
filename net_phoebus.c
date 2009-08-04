@@ -30,6 +30,22 @@ http://www.accre.vanderbilt.edu
 //*********************************************************************
 //*********************************************************************
 
+#include "network.h"
+#include "debug.h"
+#include "log.h"
+#include "phoebus.h"
+
+#ifndef _ENABLE_PHOEBUS    //** Phoebus stub goes below
+
+#include "net_sock.h"
+
+void ns_config_phoebus(NetStream_t *ns, phoebus_t *path, int tcpsize)
+{
+  ns_config_sock(ns, tcpsize);
+}
+
+#else //*** All the phoebus code.  IF not enables only ns_phoebus_config is defined
+
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -45,24 +61,11 @@ http://www.accre.vanderbilt.edu
 #include <signal.h>
 #include <errno.h>
 #include <fcntl.h>
-#include "network.h"
-#include "debug.h"
-#include "log.h"
 #include "dns_cache.h"
 #include "fmttypes.h"
 #include "net_sock.h"
 #include "net_phoebus.h"
 #include "net_fd.h"
-#include "phoebus.h"
-
-#ifndef _ENABLE_PHOEBUS    //** Phoebus stub goes below
-void ns_config_phoebus(NetStream_t *ns, char *path)
-{
-  ns_config_sock(ns);
-}
-
-#else //*** All the phoebus code.  IF not enables only ns_phoebus_config is defined
-
 #include "liblsl_client.h"
 
 
@@ -149,7 +152,7 @@ long int phoebus_read(net_sock_t *nsock, void *buf, size_t count, Net_timeout_t 
 // phoebus_connect - Creates a connection to a remote host
 //*********************************************************************
 
-int phoebus_connect(net_sock_t *nsock, char *hostname, int port, Net_timeout_t timeout)
+int phoebus_connect(net_sock_t *nsock, const char *hostname, int port, Net_timeout_t timeout)
 {
    network_phoebus_t *sock = (network_phoebus_t *)nsock;
 
@@ -193,6 +196,7 @@ int phoebus_connect(net_sock_t *nsock, char *hostname, int port, Net_timeout_t t
       }
       
       for (i=0; i<sock->p_path->p_count; i++) {
+            log_printf(15, "phoebus_connect: hop %d : %s\n", i, sock->p_path->path[i]);
 	    lsl_sess_appendchild(sock->sess, sock->p_path->path[i], LSL_DEPOT_NATIVE);
       }
       

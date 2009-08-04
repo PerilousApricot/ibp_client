@@ -30,7 +30,7 @@ http://www.accre.vanderbilt.edu
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
-#include <signal.h>
+#include <apr_signal.h>
 #include "ibp.h"
 #include "log.h"
 #include "string_token.h"
@@ -94,17 +94,9 @@ int parse_cmpstr(char *str, char *host, int *port, int *size)
 
 void ibp_configure_signals()
 {
-  sigset_t    sset;
-
-  //** Ignore SIGPIPE errors ***
-  if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
-     log_printf(0, "Error installing shutdown signal handler!\n");
-  }
-
-  //** Want everyone to ignore SIGPIPE messages
-  sigemptyset(&sset);
-  sigaddset(&sset,SIGPIPE);
-  pthread_sigmask(SIG_UNBLOCK,&sset,NULL);
+#ifdef SIGPIPE
+  apr_signal_block(SIGPIPE);
+#endif
 }
 
 

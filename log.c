@@ -33,16 +33,27 @@ http://www.accre.vanderbilt.edu
 #include "log.h"
 
 #ifndef _DISABLE_LOG
+#include <apr_thread_mutex.h>
 FILE *_log_fd = NULL;
 int _log_level = 0;
 int _log_currsize = 0;
 int _log_maxsize = 100*1024*1024;
-pthread_mutex_t _log_lock = PTHREAD_MUTEX_INITIALIZER;
-char _log_fname[1024];
+
+apr_thread_mutex_t *_log_lock = NULL;
+apr_pool_t *_log_mpool = NULL;
+char _log_fname[1024] = "stdout";
 
 
 void _open_log(char *fname, int dolock) {
-  if (dolock == 1) _lock_log(); 
+  if (dolock == 1) {
+     if (_log_lock == NULL) { 
+        assert(apr_pool_create(&_log_mpool, NULL) == APR_SUCCESS); 
+        assert(apr_thread_mutex_create(&_log_lock, APR_THREAD_MUTEX_DEFAULT, _log_mpool) == APR_SUCCESS); 
+     } 
+
+     _lock_log(); 
+  }
+
   _log_currsize = 0; 
 
   if (fname != NULL) {    //** If NULL we'll just use the old name

@@ -33,7 +33,6 @@ http://www.accre.vanderbilt.edu
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
-#include <glib.h>
 #ifdef _ENABLE_PHOEBUS
  #include <liblsl_client.h>
 #endif
@@ -41,7 +40,7 @@ http://www.accre.vanderbilt.edu
 #include "phoebus.h"
 #include "errno.h"
 #include "string_token.h"
-
+#include "iniparse.h"
 
 phoebus_t *global_phoebus = NULL;
 
@@ -49,7 +48,7 @@ phoebus_t *global_phoebus = NULL;
   void phoebus_init(void) { };
   void phoebus_destroy(void) { };
   void phoebus_print(FILE *fd) { };
-  void phoebus_load_config(GKeyFile *kf) { };
+  void phoebus_load_config(inip_file_t *kf) { };
   void phoebus_path_set(phoebus_t *p, const char *path) { };
   void phoebus_path_destroy(phoebus_t *p) { };
   void phoebus_path_to_string(char *string, int max_size, phoebus_t *p) { string[0] = '\0'; };
@@ -204,13 +203,13 @@ void phoebus_print(FILE *fd)
 // phoebus_load_config - Prints phoebus config
 //***************************************************************
 
-void phoebus_load_config(GKeyFile *kf)
+void phoebus_load_config(inip_file_t *kf)
 {
   if (global_phoebus == NULL) phoebus_init();
 
-  char *gateway = g_key_file_get_string(kf, "phoebus", "gateway", NULL);
+  char *gateway = inip_get_string(kf, "phoebus", "gateway", NULL);
   
-  if (strlen(gateway) > 1) {
+  if (gateway != NULL) {
      phoebus_path_set(global_phoebus, gateway);
      log_printf(10, "phoebus_init: Using the gateway specified in local config: %s\n", gateway);
      free(gateway);

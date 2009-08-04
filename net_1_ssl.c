@@ -30,27 +30,6 @@ http://www.accre.vanderbilt.edu
 //*********************************************************************
 //*********************************************************************
 
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
-#include <sys/uio.h>
-#include <netdb.h>
-#include <unistd.h>
-#include <string.h>
-#include <stdlib.h>
-#include <time.h>
-#include <assert.h>
-#include <signal.h>
-#include <errno.h>
-#include <fcntl.h>
-#include "network.h"
-#include "debug.h"
-#include "log.h"
-#include "dns_cache.h"
-#include "fmttypes.h"
-
 #include "network.h"
 #include "net_sock.h"
 
@@ -76,6 +55,6 @@ int ns_socket2ssl(NetStream_t *ns)
 
 void ns_config_1_ssl(NetStream_t *ns, int fd, int tcpsize)
 {
-  ns_config_sock(ns, fd, tcpsize);
+  ns_config_sock(ns, tcpsize);
 }
 

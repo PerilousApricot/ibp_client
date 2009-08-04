@@ -34,7 +34,8 @@ http://www.accre.vanderbilt.edu
 #ifndef __OPLIST_H_
 #define __OPLIST_H_
 
-#include <pthread.h>
+#include <apr_thread_mutex.h>
+#include <apr_thread_cond.h>
 #include "stack.h"
 
 #ifdef __cplusplus
@@ -47,10 +48,13 @@ extern "C" {
 
 struct oplist_s;
 
-typedef struct {   //** Used for application level callback
+struct oplist_app_notify_s {   //** Used for application level callback
    void *data;
    void (*notify)(void *data);
-} oplist_app_notify_t;
+   struct oplist_app_notify_s *next;
+   struct oplist_app_notify_s *tail;
+};
+typedef struct oplist_app_notify_s oplist_app_notify_t;
 
 typedef struct {   //** Base info for each op
    int id;       
@@ -65,17 +69,10 @@ typedef struct {     //** routines needed for implmentingthe op/oplist framework
    int blank_status;      //** Value to assign a "blank" status. Used for initialiing an op
    void *arg;             //** Container for private data if needed
    oplist_base_op_t *(*get_base_op)(void *op);
-//   void (*op_modify_ref)(void *op, int inc);
-//   int (*op_get_ref)(void *op);
    void (*op_finalize)(void *op);
    void (*op_free)(void *op);
-//   void (*op_set_status)(void *op, int status);
-//   int  (*op_get_status)(void *op);
-//   void (*op_set_id)(void *op, int id);
-//   void (*op_mark_completed)(void *op, int status);
    void (*oplist_sort_tasks)(oplist_t *oplist);        //**optional
    void (*notify)(oplist_t *oplist, void *op);  
-//   void (*op_notify)(oplist_t *oplist, void *op);     
    void (*submit_op)(oplist_t *oplist, void *op);
 } oplist_implementation_t;
 
@@ -90,13 +87,13 @@ struct oplist_s {
    int started_execution; //** If 1 the tasks have already been submitted for execution
    int free_mode;         //** How to free the oplist data when complete
    int finished_submission; //** No more tasks will be submitted so it's safe to free the data when finished
-   pthread_mutex_t lock;  //** shared lock
-   pthread_cond_t cond;   //** shared condition variable
+   apr_thread_mutex_t *lock;  //** shared lock
+   apr_thread_cond_t *cond;   //** shared condition variable
    oplist_implementation_t *imp;
 };
 
-#define lock_oplist(opl)   pthread_mutex_lock(&(opl->lock))
-#define unlock_oplist(opl) pthread_mutex_unlock(&(opl->lock))
+#define lock_oplist(opl)   apr_thread_mutex_lock(opl->lock)
+#define unlock_oplist(opl) apr_thread_mutex_unlock(opl->lock)
 
 oplist_t *new_oplist(oplist_implementation_t *imp, oplist_app_notify_t *an);
 void init_oplist(oplist_t *iol, oplist_implementation_t *imp, oplist_app_notify_t *an);
@@ -111,6 +108,7 @@ int oplist_waitall(oplist_t *iolist);
 void *oplist_waitany(oplist_t *iolist);
 void oplist_start_execution(oplist_t *oplist);
 void oplist_finished_submission(oplist_t *oplist, int free_mode);
+void oplist_notify_append(oplist_t *opl, oplist_app_notify_t *an);
 void oplist_mark_completed(oplist_t *oplist, void *op, int status);
 void init_oplist_system();
 void destroy_oplist_system();
@@ -122,8 +120,16 @@ int bop_get_id(oplist_base_op_t *bop);
 void bop_set_notify(oplist_base_op_t *bop, oplist_app_notify_t *an);
 oplist_app_notify_t *bop_get_notify(oplist_base_op_t *bop);
 void app_notify_set(oplist_app_notify_t *an, void (*notify)(void *data), void *data);
+void app_notify_append(oplist_app_notify_t *root_an, oplist_app_notify_t *an);
 void app_notify_execute(oplist_app_notify_t *an);
+void app_notify_single_execute(oplist_app_notify_t *an);
 void bop_init(oplist_base_op_t *bop, int id, int status, oplist_app_notify_t *an);
+
+extern int _oplist_counter;
+extern apr_thread_mutex_t *_oplist_lock;
+extern apr_pool_t *_oplist_pool;
+
+
 #ifdef __cplusplus
 }
 #endif

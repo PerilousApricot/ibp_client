@@ -35,17 +35,17 @@ http://www.accre.vanderbilt.edu
 
 #define N_BUFSIZE  1024
 
-#include <sys/select.h>
-#include <sys/time.h>
-#include <pthread.h>
-#include "network.h"
-#include "phoebus.h"
+//#include <sys/select.h>
+//#include <sys/time.h>
+//#include <pthread.h>
+//#include "network.h"
+//#include "phoebus.h"
 
-#ifdef _ENABLE_PHOEBUS
-#include "liblsl_client.h"
-#else
-typedef void liblslSess;
-#endif
+//#ifdef _ENABLE_PHOEBUS
+//#include "liblsl_client.h"
+//#else
+//typedef void liblslSess;
+////#endif
 
 typedef struct {
    phoebus_t *p_path;
@@ -66,7 +66,7 @@ int phoebus_status(net_sock_t *sock);
 int phoebus_close(net_sock_t *sock);
 long int phoebus_write(net_sock_t *sock, const void *buf, size_t count, Net_timeout_t tm);
 long int phoebus_read(net_sock_t *sock, void *buf, size_t count, Net_timeout_t tm);
-int phoebus_connect(net_sock_t *sock, char *hostname, int port, Net_timeout_t timeout);
+int phoebus_connect(net_sock_t *sock, const char *hostname, int port, Net_timeout_t timeout);
 #endif
 
 void ns_config_phoebus(NetStream_t *ns, phoebus_t *path, int tcpsize);

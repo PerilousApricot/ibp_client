@@ -38,7 +38,7 @@ http://www.accre.vanderbilt.edu
 #include <string.h>
 #include <math.h>
 #include <signal.h>
-#include <glib.h>
+#include <apr_time.h>
 #include "network.h"
 #include "fmttypes.h"
 #include "network.h"
@@ -54,7 +54,7 @@ int n_depots;
 int ibp_timeout;
 int sync_transfer;
 int nthreads;
-int use_proxy;
+int use_alias;
 ibp_connect_context_t *cc = NULL;
 
 //*************************************************************************
@@ -225,12 +225,12 @@ void simple_test()
 }
 
 //*************************************************************************
-//  create_proxy_allocs - Creates a group of proxy allocations in parallel
-//   The proxy allocations are based on the input allocations and round-robined 
+//  create_alias_allocs - Creates a group of alias allocations in parallel
+//   The alias allocations are based on the input allocations and round-robined 
 //   among them
 //*************************************************************************
 
-ibp_capset_t *create_proxy_allocs(int nallocs, ibp_capset_t *base_caps, int n_base)
+ibp_capset_t *create_alias_allocs(int nallocs, ibp_capset_t *base_caps, int n_base)
 {
   int i, err;
   oplist_t *iolist;
@@ -243,14 +243,14 @@ ibp_capset_t *create_proxy_allocs(int nallocs, ibp_capset_t *base_caps, int n_ba
 
   for (i=0; i<nallocs; i++) {
      bcap = &(base_caps[i % n_base]);
-     op = new_ibp_proxy_alloc_op(&(caps[i]), get_ibp_cap(bcap, IBP_MANAGECAP), 0, 0, 0, ibp_timeout, NULL, NULL);
+     op = new_ibp_alias_alloc_op(&(caps[i]), get_ibp_cap(bcap, IBP_MANAGECAP), 0, 0, 0, ibp_timeout, NULL, NULL);
      add_ibp_oplist(iolist, op);
   }
 
   io_start(iolist);
   err = io_waitall(iolist);  
   if (err != IBP_OK) {
-     printf("create_proxy_allocs: At least 1 error occured! * ibp_errno=%d * nfailed=%d\n", err, oplist_nfailed(iolist)); 
+     printf("create_alias_allocs: At least 1 error occured! * ibp_errno=%d * nfailed=%d\n", err, oplist_nfailed(iolist)); 
   }    
   free_oplist(iolist);
 
@@ -258,10 +258,10 @@ ibp_capset_t *create_proxy_allocs(int nallocs, ibp_capset_t *base_caps, int n_ba
 }
 
 //*************************************************************************
-// proxy_remove_allocs - Remove a list of *PROXY* allocations
+// alias_remove_allocs - Remove a list of *ALIAS* allocations
 //*************************************************************************
 
-void proxy_remove_allocs(ibp_capset_t *caps_list, ibp_capset_t *mcaps_list, int nallocs, int mallocs)
+void alias_remove_allocs(ibp_capset_t *caps_list, ibp_capset_t *mcaps_list, int nallocs, int mallocs)
 {
   int i, j, err;
   oplist_t *iolist;
@@ -271,7 +271,7 @@ void proxy_remove_allocs(ibp_capset_t *caps_list, ibp_capset_t *mcaps_list, int 
 
   for (i=0; i<nallocs; i++) {
      j = i % mallocs;
-     op = new_ibp_proxy_remove_op(get_ibp_cap(&(caps_list[i]), IBP_MANAGECAP), 
+     op = new_ibp_alias_remove_op(get_ibp_cap(&(caps_list[i]), IBP_MANAGECAP), 
               get_ibp_cap(&(mcaps_list[j]), IBP_MANAGECAP), ibp_timeout, NULL, NULL);
      add_ibp_oplist(iolist, op);
   }
@@ -279,7 +279,7 @@ void proxy_remove_allocs(ibp_capset_t *caps_list, ibp_capset_t *mcaps_list, int 
   io_start(iolist);
   err = io_waitall(iolist);  
   if (err != IBP_OK) {
-     printf("proxy_remove_allocs: At least 1 error occured! * ibp_errno=%d * nfailed=%d\n", err, oplist_nfailed(iolist)); 
+     printf("alias_remove_allocs: At least 1 error occured! * ibp_errno=%d * nfailed=%d\n", err, oplist_nfailed(iolist)); 
   }    
   free_oplist(iolist);
 
@@ -322,6 +322,7 @@ ibp_capset_t *create_allocs(int nallocs, int asize)
   err = io_waitall(iolist);  
   if (err != IBP_OK) {
      printf("create_allocs: At least 1 error occured! * ibp_errno=%d * nfailed=%d\n", err, oplist_nfailed(iolist)); 
+     abort();
   }    
   free_oplist(iolist);
 
@@ -349,6 +350,7 @@ void remove_allocs(ibp_capset_t *caps_list, int nallocs)
   err = io_waitall(iolist);  
   if (err != IBP_OK) {
      printf("remove_allocs: At least 1 error occured! * ibp_errno=%d * nfailed=%d\n", err, oplist_nfailed(iolist)); 
+     abort();
   }    
   free_oplist(iolist);
 
@@ -468,7 +470,7 @@ void random_allocs(ibp_capset_t *caps, int n, int asize, int block_size, double 
          rnd = rand()/(RAND_MAX + 1.0);
 
          if ((j==(nblocks-1)) && (rem > 0)) { len = rem; } else { len = block_size; }
-         op = new_ibp_read_op(get_ibp_cap(&(caps[i]), IBP_READCAP), j*block_size, len, buffer, ibp_timeout, NULL, cc);
+//         op = new_ibp_read_op(get_ibp_cap(&(caps[i]), IBP_READCAP), j*block_size, len, buffer, ibp_timeout, NULL, cc);
 
          if (rnd < rfrac) {
             op = new_ibp_read_op(get_ibp_cap(&(caps[i]), IBP_READCAP), j*block_size, len, buffer, ibp_timeout, NULL, cc);
@@ -521,6 +523,7 @@ double small_write_allocs(ibp_capset_t *caps, int n, int asize, int small_count,
      rnd = rand()/(RAND_MAX+1.0);     
      rnd = lmin + (lmax - lmin) * rnd;
      io_size = exp(rnd);
+     if (io_size == 0) io_size = 1;
      nbytes = nbytes + io_size;
 
      rnd = rand()/(RAND_MAX+1.0);
@@ -575,6 +578,7 @@ double small_read_allocs(ibp_capset_t *caps, int n, int asize, int small_count, 
      rnd = rand()/(RAND_MAX+1.0);     
      rnd = lmin + (lmax - lmin) * rnd;
      io_size = exp(rnd);
+     if (io_size == 0) io_size = 1;
      nbytes = nbytes + io_size;
 
      rnd = rand()/(RAND_MAX+1.0);
@@ -629,6 +633,7 @@ double small_random_allocs(ibp_capset_t *caps, int n, int asize, double readfrac
      rnd = rand()/(RAND_MAX+1.0);     
      rnd = lmin + (lmax - lmin) * rnd;
      io_size = exp(rnd);
+     if (io_size == 0) io_size = 1;
      nbytes = nbytes + io_size;
 
      rnd = rand()/(RAND_MAX+1.0);
@@ -669,7 +674,7 @@ int main(int argc, char **argv)
   rid_t rid;
   int port;
   char buffer[1024];
-  GTimer *gtimer = g_timer_new();
+  apr_time_t stime, dtime;
   double dt;
   char *ppath;
   phoebus_t pcc;
@@ -680,10 +685,10 @@ int main(int argc, char **argv)
   if (argc < 12) {
      printf("\n");
      printf("ibp_perf [-d|-dd] [-config ibp.cfg] [-phoebus gateway_list] [-tcpsize tcpbufsize]\n");
-     printf("           [-duration duration] [-sync] [-proxy]\n");
+     printf("           [-duration duration] [-sync] [-alias]\n");
      printf("          n_depots depot1 port1 resource_id1 ... depotN portN ridN\n");
      printf("          nthreads ibp_timeout\n");
-     printf("          proxy_createremove_count createremove_count\n");
+     printf("          alias_createremove_count createremove_count\n");
      printf("          readwrite_count readwrite_alloc_size rw_block_size read_mix_fraction\n");
      printf("          smallio_count small_min_size small_max_size small_read_fraction\n");
      printf("\n");
@@ -697,14 +702,14 @@ int main(int argc, char **argv)
      printf("-duration duration  - Allocation duration in sec.  Needs to be big enough to last the entire\n");
      printf("                      run.  The default duration is %d sec.\n", a_duration);
      printf("-sync               - Use synchronous protocol.  Default uses async.\n");
-     printf("-proxy              - Use proxy allocations for all I/O operations\n");
+     printf("-alias              - Use alias allocations for all I/O operations\n");
      printf("n_depots            - Number of depot tuplets\n");
      printf("depot               - Depot hostname\n");
      printf("port                - IBP port on depot\n"); 
      printf("resource_id         - Resource ID to use on depot\n");
      printf("nthreads            - Max Number of simultaneous threads to use.  Use -1 for defaults or value in ibp.cfg\n");
      printf("ibp_timeout         - Timeout(sec) for each IBP copmmand\n");
-     printf("proxy_createremove_count* - Number of 0 byte files to create and remove using proxy allocations\n");
+     printf("alias_createremove_count* - Number of 0 byte files to create and remove using alias allocations\n");
      printf("createremove_count* - Number of 0 byte files to create and remove to test metadata performance\n");
      printf("readwrite_count*    - Number of files to write sequentially then read sequentially\n");
      printf("readwrite_alloc_size  - Size of each allocation in KB for sequential and random tests\n");
@@ -769,9 +774,9 @@ int main(int argc, char **argv)
      i++;
   }
 
-  use_proxy = 0;
-  if (strcmp(argv[i], "-proxy") == 0) { //** Check if we want to use proxy allocation
-     use_proxy = 1;
+  use_alias = 0;
+  if (strcmp(argv[i], "-alias") == 0) { //** Check if we want to use alias allocation
+     use_alias = 1;
      i++;
   }
 
@@ -805,7 +810,7 @@ int main(int argc, char **argv)
   ibp_timeout = atoi(argv[i]); i++;
 
    //****** Get the different Stream counts *****
-  int proxycreateremove_count = atoi(argv[i]); i++;
+  int aliascreateremove_count = atoi(argv[i]); i++;
   int createremove_count = atoi(argv[i]); i++;
   int readwrite_count = atoi(argv[i]); i++;
   int readwrite_size = atoi(argv[i])*1024; i++;
@@ -838,7 +843,7 @@ int main(int argc, char **argv)
   } else {
      printf("Transfer_mode: ASYNC\n");
   }
-  printf("Use proxy: %d\n", use_proxy);
+  printf("Use alias: %d\n", use_alias);
 
   if (cc != NULL) {
      switch (cc->type) {
@@ -859,7 +864,7 @@ int main(int argc, char **argv)
   printf("\n");
 
   printf("======= Bulk transfer options =======\n");
-  printf("proxycreateremove_count: %d\n", proxycreateremove_count);
+  printf("aliascreateremove_count: %d\n", aliascreateremove_count);
   printf("createremove_count: %d\n", createremove_count);
   printf("readwrite_count: %d\n", readwrite_count);
   printf("readwrite_alloc_size: %dkb\n", readwrite_size/1024);
@@ -884,23 +889,23 @@ int main(int argc, char **argv)
   }
 
   //**************** Create/Remove tests ***************************
-  if (proxycreateremove_count > 0) {
-     i = proxycreateremove_count/nthreads;
-     printf("Starting Proxy create test (total files: %d, approx per thread: %d)\n",proxycreateremove_count, i);
+  if (aliascreateremove_count > 0) {
+     i = aliascreateremove_count/nthreads;
+     printf("Starting Alias create test (total files: %d, approx per thread: %d)\n",aliascreateremove_count, i);
      base_caps = create_allocs(1, 1);
-     g_timer_start(gtimer);
-     caps_list = create_proxy_allocs(proxycreateremove_count, base_caps, 1);
-     g_timer_stop(gtimer);
-     dt = g_timer_elapsed(gtimer, NULL);
-     r1 = 1.0*proxycreateremove_count/dt;
-     printf("Proxy create : %lf creates/sec (%.2lf sec total) \n", r1, dt);
+     stime = apr_time_now();
+     caps_list = create_alias_allocs(aliascreateremove_count, base_caps, 1);
+     dtime = apr_time_now() - stime;
+     dt = dtime / (1.0 * APR_USEC_PER_SEC);
+     r1 = 1.0*aliascreateremove_count/dt;
+     printf("Alias create : %lf creates/sec (%.2lf sec total) \n", r1, dt);
 
-     g_timer_start(gtimer);
-     proxy_remove_allocs(caps_list, base_caps, proxycreateremove_count, 1);
-     g_timer_stop(gtimer);
-     dt = g_timer_elapsed(gtimer, NULL);
-     r1 = 1.0*proxycreateremove_count/dt;
-     printf("Proxy remove : %lf removes/sec (%.2lf sec total) \n", r1, dt);
+     stime = apr_time_now();
+     alias_remove_allocs(caps_list, base_caps, aliascreateremove_count, 1);
+     dtime = apr_time_now() - stime;
+     dt = dtime / (1.0 * APR_USEC_PER_SEC);
+     r1 = 1.0*aliascreateremove_count/dt;
+     printf("Alias remove : %lf removes/sec (%.2lf sec total) \n", r1, dt);
      printf("\n");
 
 printf("-----------------------------\n"); fflush(stdout);
@@ -914,17 +919,17 @@ printf("-----------------------------\n"); fflush(stdout);
      i = createremove_count/nthreads;
      printf("Starting Create test (total files: %d, approx per thread: %d)\n",createremove_count, i);
 
-     g_timer_start(gtimer);
+     stime = apr_time_now();
      caps_list = create_allocs(createremove_count, 1);
-     g_timer_stop(gtimer);
-     dt = g_timer_elapsed(gtimer, NULL);
+     dtime = apr_time_now() - stime;
+     dt = dtime / (1.0 * APR_USEC_PER_SEC);
      r1 = 1.0*createremove_count/dt;
      printf("Create : %lf creates/sec (%.2lf sec total) \n", r1, dt);
 
-     g_timer_start(gtimer);
+     stime = apr_time_now();
      remove_allocs(caps_list, createremove_count);
-     g_timer_stop(gtimer);
-     dt = g_timer_elapsed(gtimer, NULL);
+     dtime = apr_time_now() - stime;
+     dt = dtime / (1.0 * APR_USEC_PER_SEC);
      r1 = 1.0*createremove_count/dt;
      printf("Remove : %lf removes/sec (%.2lf sec total) \n", r1, dt);
      printf("\n");
@@ -939,84 +944,87 @@ printf("-----------------------------\n"); fflush(stdout);
      printf(" -- total size: %lfMB, approx per thread: %lfMB\n", r1, r2);
 
      printf("Creating allocations...."); fflush(stdout);
-     g_timer_start(gtimer);
+     stime = apr_time_now();
      caps_list = create_allocs(readwrite_count, readwrite_size);
-     g_timer_stop(gtimer);
-     dt = g_timer_elapsed(gtimer, NULL);
+     dtime = apr_time_now() - stime;
+     dt = dtime / (1.0 * APR_USEC_PER_SEC);
      r1 = 1.0*readwrite_count/dt;
      printf(" %lf creates/sec (%.2lf sec total) \n", r1, dt);
 
-     if (use_proxy) {
+     if (use_alias) {
         base_caps = caps_list;
-        printf("Creating proxy allocations...."); fflush(stdout);
-        g_timer_start(gtimer);
-        caps_list = create_proxy_allocs(readwrite_count, base_caps, readwrite_count);
-        g_timer_stop(gtimer);
-        dt = g_timer_elapsed(gtimer, NULL);
+        printf("Creating alias allocations...."); fflush(stdout);
+        stime = apr_time_now();
+        caps_list = create_alias_allocs(readwrite_count, base_caps, readwrite_count);
+        dtime = apr_time_now() - stime;
+        dt = dtime / (1.0 * APR_USEC_PER_SEC);
         r1 = 1.0*readwrite_count/dt;
         printf(" %lf creates/sec (%.2lf sec total) \n", r1, dt);
      }
 
-     g_timer_start(gtimer);
+     stime = apr_time_now();
      write_allocs(caps_list, readwrite_count, readwrite_size, rw_block_size);
-     g_timer_stop(gtimer);
-     dt = g_timer_elapsed(gtimer, NULL);
+     dtime = apr_time_now() - stime;
+     dt = dtime / (1.0 * APR_USEC_PER_SEC);
      r1 = 1.0*readwrite_count*readwrite_size/(dt*1024*1024);
      printf("Write: %lf MB/sec (%.2lf sec total) \n", r1, dt);
 
-     g_timer_start(gtimer);
+     stime = apr_time_now();
      read_allocs(caps_list, readwrite_count, readwrite_size, rw_block_size);
-     g_timer_stop(gtimer);
-     dt = g_timer_elapsed(gtimer, NULL);
+     dtime = apr_time_now() - stime;
+     dt = dtime / (1.0 * APR_USEC_PER_SEC);
      r1 = 1.0*readwrite_count*readwrite_size/(dt*1024*1024);
      printf("Read: %lf MB/sec (%.2lf sec total) \n", r1, dt);
 
-     g_timer_start(gtimer);
+     stime = apr_time_now();
      random_allocs(caps_list, readwrite_count, readwrite_size, rw_block_size, read_mix_fraction);
-     g_timer_stop(gtimer);
-     dt = g_timer_elapsed(gtimer, NULL);
+     dtime = apr_time_now() - stime;
+     dt = dtime / (1.0 * APR_USEC_PER_SEC);
      r1 = 1.0*readwrite_count*readwrite_size/(dt*1024*1024);
      printf("Random: %lf MB/sec (%.2lf sec total) \n", r1, dt);
 
      //**************** Small I/O tests ***************************
      if (smallio_count > 0) {
+        if (small_min_size == 0) small_min_size = 1;
+        if (small_max_size == 0) small_max_size = 1;
+
         printf("\n");
         printf("Starting Small Random I/O tests...\n");
 
-        g_timer_start(gtimer);
+        stime = apr_time_now();
         r1 = small_write_allocs(caps_list, readwrite_count, readwrite_size, smallio_count, small_min_size, small_max_size);
-        g_timer_stop(gtimer);
-        dt = g_timer_elapsed(gtimer, NULL);
+        dtime = apr_time_now() - stime;
+        dt = dtime / (1.0 * APR_USEC_PER_SEC);
         r1 = r1/(1024.0*1024.0);
         r2 = r1/dt;
         r3 = smallio_count; r3 = r3 / dt;
         printf("Small Random Write: %lf MB/sec (%.2lf sec total using %lfMB or %.2lf ops/sec) \n", r2, dt, r1, r3);
 
-        g_timer_start(gtimer);
+        stime = apr_time_now();
         r1 = small_read_allocs(caps_list, readwrite_count, readwrite_size, smallio_count, small_min_size, small_max_size);
-        g_timer_stop(gtimer);
-        dt = g_timer_elapsed(gtimer, NULL);
+        dtime = apr_time_now() - stime;
+        dt = dtime / (1.0 * APR_USEC_PER_SEC);
         r1 = r1/(1024.0*1024.0);
         r2 = r1/dt;
         r3 = smallio_count; r3 = r3 / dt;
         printf("Small Random Read: %lf MB/sec (%.2lf sec total using %lfMB or %.2lf ops/sec) \n", r2, dt, r1, r3);
 
-        g_timer_start(gtimer);
+        stime = apr_time_now();
         r1 = small_random_allocs(caps_list, readwrite_count, readwrite_size, small_read_fraction, smallio_count, small_min_size, small_max_size);
-        g_timer_stop(gtimer);
-        dt = g_timer_elapsed(gtimer, NULL);
+        dtime = apr_time_now() - stime;
+        dt = dtime / (1.0 * APR_USEC_PER_SEC);
         r1 = r1/(1024.0*1024.0);
         r2 = r1/dt;
         r3 = smallio_count; r3 = r3 / dt;
         printf("Small Random R/W: %lf MB/sec (%.2lf sec total using %lfMB or %.2lf ops/sec) \n", r2, dt, r1, r3);
      }
 
-     if (use_proxy) {
-        printf("Removing proxy allocations...."); fflush(stdout);
-        g_timer_start(gtimer);
-        proxy_remove_allocs(caps_list, base_caps, readwrite_count, readwrite_count);
-        g_timer_stop(gtimer);
-        dt = g_timer_elapsed(gtimer, NULL);
+     if (use_alias) {
+        printf("Removing alias allocations...."); fflush(stdout);
+        stime = apr_time_now();
+        alias_remove_allocs(caps_list, base_caps, readwrite_count, readwrite_count);
+        dtime = apr_time_now() - stime;
+        dt = dtime / (1.0 * APR_USEC_PER_SEC);
         r1 = 1.0*readwrite_count/dt;
         printf(" %lf removes/sec (%.2lf sec total) \n", r1, dt);
 
@@ -1024,23 +1032,20 @@ printf("-----------------------------\n"); fflush(stdout);
      }
 
      printf("Removing allocations...."); fflush(stdout);
-     g_timer_start(gtimer);
+     stime = apr_time_now();
      remove_allocs(caps_list, readwrite_count);
-     g_timer_stop(gtimer);
-     dt = g_timer_elapsed(gtimer, NULL);
+     dtime = apr_time_now() - stime;
+     dt = dtime / (1.0 * APR_USEC_PER_SEC);
      r1 = 1.0*readwrite_count/dt;
      printf(" %lf removes/sec (%.2lf sec total) \n", r1, dt);
      printf("\n");
 
   }  
-//  printf("sleeping....\n"); fflush(stdout);
-//  sleep(60);
 
   printf("Final network connection counter: %d\n", network_counter(NULL));
 
   ibp_finalize();  //** Shutdown IBP
 
-  g_timer_destroy(gtimer);
   return(0);
 }
 

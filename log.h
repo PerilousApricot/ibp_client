@@ -40,6 +40,9 @@ http://www.accre.vanderbilt.edu
 #include <stdio.h>
 #include <pthread.h>
 #include <string.h>
+#include <assert.h>
+#include <apr_pools.h>
+#include <apr_thread_mutex.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -49,15 +52,15 @@ extern FILE *_log_fd;
 extern int _log_level;
 extern int _log_maxsize;
 extern int _log_currsize;
-extern pthread_mutex_t _log_lock;
+extern apr_thread_mutex_t *_log_lock;
+extern apr_pool_t *_log_mpool;
 extern char _log_fname[1024];
 
 void _open_log(char *fname, int dolock);
 void _close_log();
 
-#define _lock_log() pthread_mutex_lock(&_log_lock)
-#define _unlock_log() pthread_mutex_unlock(&_log_lock)
-//#define truncate_log() ftruncate(fileno(_log_fd), 0); _log_currsize = 0
+#define _lock_log() apr_thread_mutex_lock(_log_lock)
+#define _unlock_log() apr_thread_mutex_unlock(_log_lock)
 #define log_code(a) a
 #define set_log_level(n) _log_level = n
 #define set_log_maxsize(n) _log_maxsize = n
@@ -67,6 +70,10 @@ void _close_log();
 #define open_log(fname) _open_log(fname, 1)
 #define log_printf(n, ...) \
    if ((n) <= _log_level) { \
+      if (_log_lock == NULL) { \
+         assert(apr_pool_create(&_log_mpool, NULL) == APR_SUCCESS); \
+         assert(apr_thread_mutex_create(&_log_lock, APR_THREAD_MUTEX_DEFAULT, _log_mpool) == APR_SUCCESS); \
+       } \
       _lock_log(); \
       if (_log_fd == NULL) _log_fd = stdout; \
       _log_currsize += fprintf(_log_fd, __VA_ARGS__); \
@@ -77,6 +84,10 @@ void _close_log();
 
 #define assign_log_fd(fd) _log_fd = fd
 #define flush_log() \
+   if (_log_lock == NULL) { \
+      assert(apr_pool_create(&_log_mpool, NULL) == APR_SUCCESS); \
+      assert(apr_thread_mutex_create(&_log_lock, APR_THREAD_MUTEX_DEFAULT, _log_mpool) == APR_SUCCESS); \
+   } \
    _lock_log();     \
    fflush(_log_fd); \
    _unlock_log();

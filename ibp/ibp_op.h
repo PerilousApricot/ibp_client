@@ -61,6 +61,7 @@ typedef struct {
    int new_command;     //** byte "cost" of just the command portion excluding any data transfer
    int64_t max_workload;    //** Max workload allowed in a given connection
    int wait_stable_time; //** Time to wait before opening a new connection for a heavily loaded depot
+   int abort_conn_attempts; //** If this many failed connection requests occur in a row we abort
    int check_connection_interval;  //**# of secs to wait between checks if we need more connections to a depot
    int max_retry;        //** Max number of times to retry a command before failing.. only for dead socket retries
    ibp_connect_context_t cc[IBP_MAX_NUM_CMDS+1];  //** Default connection contexts for EACH command
@@ -81,38 +82,45 @@ typedef struct {  //** Read/Write operation
 //   int counter;
 } ibp_op_rw_t;
 
+typedef struct { //** MERGE allocoation op
+   char mkey[MAX_KEY_SIZE];      //** Master key
+   char mtypekey[MAX_KEY_SIZE];  
+   char ckey[MAX_KEY_SIZE];      //** Child key
+   char ctypekey[MAX_KEY_SIZE]; 
+} ibp_op_merge_alloc_t;
+
 typedef struct {  //**Allocate operation
    int size;
-   int offset;                         //** ibp_proxy_allocate
-   int duration;                       //** ibp_proxy_allocate
-   char       key[MAX_KEY_SIZE];      //** ibp_rename/proxy_allocate
-   char       typekey[MAX_KEY_SIZE];  //** ibp_rename/proxy_allocate
-   ibp_cap_t *mcap;         //** This is just used for ibp_rename
+   int offset;                         //** ibp_alias_allocate
+   int duration;                       //** ibp_alias_allocate
+   char       key[MAX_KEY_SIZE];      //** ibp_rename/alias_allocate
+   char       typekey[MAX_KEY_SIZE];  //** ibp_rename/alias_allocate
+   ibp_cap_t *mcap;         //** This is just used for ibp_rename/ibp_split_allocate
    ibp_capset_t *caps;
    ibp_depot_t *depot;
    ibp_attributes_t *attr;
 } ibp_op_alloc_t;
 
 typedef struct {  //** modify count and PROBE  operation
-   int       cmd;    //** IBP_MANAGE or IBP_PROXY_MANAGE
+   int       cmd;    //** IBP_MANAGE or IBP_ALIAS_MANAGE
    ibp_cap_t *cap;
-   char       mkey[MAX_KEY_SIZE];     //** USed for PROXY_MANAGE
-   char       mtypekey[MAX_KEY_SIZE]; //** USed for PROXY_MANAGE
+   char       mkey[MAX_KEY_SIZE];     //** USed for ALIAS_MANAGE
+   char       mtypekey[MAX_KEY_SIZE]; //** USed for ALIAS_MANAGE
    char       key[MAX_KEY_SIZE];
    char       typekey[MAX_KEY_SIZE];
    int        mode;
    int        captype;
    ibp_capstatus_t *probe;
-   ibp_proxy_capstatus_t *proxy_probe;
+   ibp_alias_capstatus_t *alias_probe;
 } ibp_op_probe_t;
 
 typedef struct {  //** modify Allocation operation
    ibp_cap_t *cap;
-   char       mkey[MAX_KEY_SIZE];     //** USed for PROXY_MANAGE
-   char       mtypekey[MAX_KEY_SIZE]; //** USed for PROXY_MANAGE
+   char       mkey[MAX_KEY_SIZE];     //** USed for ALIAS_MANAGE
+   char       mtypekey[MAX_KEY_SIZE]; //** USed for ALIAS_MANAGE
    char       key[MAX_KEY_SIZE];
    char       typekey[MAX_KEY_SIZE];
-   size_t     offset;    //** IBP_PROXY_MANAGE
+   size_t     offset;    //** IBP_ALIAS_MANAGE
    size_t     size;
    time_t     duration;
    int        reliability;
@@ -125,11 +133,12 @@ typedef struct {  //** depot depot copy operations
    char       src_key[MAX_KEY_SIZE];
    char       src_typekey[MAX_KEY_SIZE];
    int        src_offset;
-   int        dest_offset;  //** Not supported now by IBP protocol:(
+   int        dest_offset;
    int        len;
    int        dest_timeout;
    int        dest_client_timeout;
    int        ibp_command;
+   int        ctype;
 } ibp_op_copy_t;
 
 typedef struct {  //** Modify a depot/RID settings
@@ -160,21 +169,11 @@ typedef struct {  //** Get a list of RID's for a depot
 typedef struct _ibp_op_s { //** Individual IO operation
    Hportal_op_t hop;
    oplist_base_op_t bop;
-//   char *hostport; //** Depot hostname:port
-//   int  cmp_size;  //** Used for ordering commands within the same host
    int primary_cmd;//** Primary sync IBP command family
    int sub_cmd;    //** sub command, if applicable
-//   int timeout;    //** Command timeout
-//   int workload;   //** Workload for measuring channel usage
-//   int retry_count;//** Number of times retried
-//   int (*send_command)(struct _ibp_op_s *op, NetStream_t *ns);  //**Send command routine
-//   int (*send_phase)(struct _ibp_op_s *op, NetStream_t *ns);    //**Handle "sending" side of command
-//   int (*recv_phase)(struct _ibp_op_s *op, NetStream_t *ns);    //**Handle "receiving" half of command
-//   int (*destroy_command)(struct _ibp_op_s *op);                //**Destroys the data structure
-//   time_t start_time;
-//   time_t end_time;
    union {         //** Holds the individual commands options
      ibp_op_alloc_t  alloc_op;
+     ibp_op_merge_alloc_t  merge_op;
      ibp_op_probe_t  probe_op;
      ibp_op_rw_t     rw_op;
      ibp_op_copy_t   copy_op;
@@ -187,8 +186,6 @@ typedef struct _ibp_op_s { //** Individual IO operation
 } ibp_op_t;
 
 //** ibp_op.c **
-//#define ibp_op_inc_ref(op) ibp_op_modify_ref(op, 1)
-//#define ibp_op_dec_ref(op) ibp_op_modify_ref(op, -1)
 ibp_op_t *new_ibp_op();
 void init_ibp_base_op(ibp_op_t *op, char *logstr, int timeout, int workload, char *hostport, 
      int cmp_size, int primary_cmd, int sub_cmd, oplist_app_notify_t *an, ibp_connect_context_t *cc);
@@ -212,38 +209,51 @@ ibp_op_t *new_ibp_append_op(ibp_cap_t *cap, int size, char *buffer, int timeout,
 void set_ibp_append_op(ibp_op_t *op, ibp_cap_t *cap, int size, char *buffer, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
 ibp_op_t *new_ibp_alloc_op(ibp_capset_t *caps, int size, ibp_depot_t *depot, ibp_attributes_t *attr, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
 void set_ibp_alloc_op(ibp_op_t *op, ibp_capset_t *caps, int size, ibp_depot_t *depot, ibp_attributes_t *attr, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
-void set_ibp_proxy_alloc_op(ibp_op_t *op, ibp_capset_t *caps, ibp_cap_t *mcap, int offset, int size,
+void set_ibp_split_alloc_op(ibp_op_t *op, ibp_cap_t *mcap, ibp_capset_t *caps, int size, 
+       ibp_attributes_t *attr, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
+ibp_op_t *new_ibp_merge_alloc_op(ibp_cap_t *mcap, ibp_cap_t *ccap,
+       int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
+void set_ibp_merge_alloc_op(ibp_op_t *op, ibp_cap_t *mcap, ibp_cap_t *ccap, int timeout, 
+    oplist_app_notify_t *an, ibp_connect_context_t *cc);
+ibp_op_t *new_ibp_split_alloc_op(ibp_cap_t *mcap, ibp_capset_t *caps, int size,
+       ibp_attributes_t *attr, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
+void set_ibp_alias_alloc_op(ibp_op_t *op, ibp_capset_t *caps, ibp_cap_t *mcap, int offset, int size,
    int duration, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
-ibp_op_t *new_ibp_proxy_alloc_op(ibp_capset_t *caps, ibp_cap_t *mcap, int offset, int size,
+ibp_op_t *new_ibp_alias_alloc_op(ibp_capset_t *caps, ibp_cap_t *mcap, int offset, int size,
    int duration, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
 ibp_op_t *new_ibp_rename_op(ibp_capset_t *caps, ibp_cap_t *mcap, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
 void set_ibp_rename_op(ibp_op_t *op, ibp_capset_t *caps, ibp_cap_t *mcap, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
 ibp_op_t *new_ibp_remove_op(ibp_cap_t *cap, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
 void set_ibp_remove_op(ibp_op_t *op, ibp_cap_t *cap, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
-void set_ibp_proxy_remove_op(ibp_op_t *op, ibp_cap_t *cap, ibp_cap_t *mcap, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
-ibp_op_t *new_ibp_proxy_remove_op(ibp_cap_t *cap, ibp_cap_t *mcap, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
+void set_ibp_alias_remove_op(ibp_op_t *op, ibp_cap_t *cap, ibp_cap_t *mcap, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
+ibp_op_t *new_ibp_alias_remove_op(ibp_cap_t *cap, ibp_cap_t *mcap, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
 ibp_op_t *new_ibp_modify_count_op(ibp_cap_t *cap, int mode, int captype, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
 void set_ibp_modify_count_op(ibp_op_t *op, ibp_cap_t *cap, int mode, int captype, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
-void set_ibp_proxy_modify_count_op(ibp_op_t *op, ibp_cap_t *cap, ibp_cap_t *mcap, int mode, int captype, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
-ibp_op_t *new_ibp_proxy_modify_count_op(ibp_cap_t *cap, ibp_cap_t *mcap, int mode, int captype, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
+void set_ibp_alias_modify_count_op(ibp_op_t *op, ibp_cap_t *cap, ibp_cap_t *mcap, int mode, int captype, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
+ibp_op_t *new_ibp_alias_modify_count_op(ibp_cap_t *cap, ibp_cap_t *mcap, int mode, int captype, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
 void set_ibp_modify_alloc_op(ibp_op_t *op, ibp_cap_t *cap, size_t size, time_t duration, int reliability, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
 ibp_op_t *new_ibp_modify_alloc_op(ibp_cap_t *cap, size_t size, time_t duration, int reliability, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
 ibp_op_t *new_ibp_probe_op(ibp_cap_t *cap, ibp_capstatus_t *probe, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
 void set_ibp_probe_op(ibp_op_t *op, ibp_cap_t *cap, ibp_capstatus_t *probe, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
-void set_ibp_proxy_probe_op(ibp_op_t *op, ibp_cap_t *cap, ibp_proxy_capstatus_t *probe, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
-ibp_op_t *new_ibp_proxy_probe_op(ibp_cap_t *cap, ibp_proxy_capstatus_t *probe, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
-//void ibp_op_modify_ref(ibp_op_t *op, int n);
+void set_ibp_alias_probe_op(ibp_op_t *op, ibp_cap_t *cap, ibp_alias_capstatus_t *probe, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
+ibp_op_t *new_ibp_alias_probe_op(ibp_cap_t *cap, ibp_alias_capstatus_t *probe, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
 ibp_op_t *new_ibp_copyappend_op(int ns_type, char *path, ibp_cap_t *srccap, ibp_cap_t *destcap, int src_offset, int size,
         int src_timeout, int  dest_timeout, int dest_client_timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
 void set_ibp_copyappend_op(ibp_op_t *op, int ns_type, char *path, ibp_cap_t *srccap, ibp_cap_t *destcap, int src_offset, int size,
         int src_timeout, int  dest_timeout, int dest_client_timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
+void set_ibp_copy_op(ibp_op_t *op, int mode, int ns_type, char *path, ibp_cap_t *srccap, ibp_cap_t *destcap,
+        int src_offset, int dest_offset, int size, int src_timeout, int  dest_timeout, 
+        int dest_client_timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
+ibp_op_t *new_ibp_copy_op(int mode, int ns_type, char *path, ibp_cap_t *srccap, ibp_cap_t *destcap,
+        int src_offset, int dest_offset, int size, int src_timeout,
+        int  dest_timeout, int dest_client_timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
 void set_ibp_depot_modify_op(ibp_op_t *op, ibp_depot_t *depot, char *password, size_t hard, size_t soft,
       time_t duration, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
 ibp_op_t *new_ibp_depot_modify_op(ibp_depot_t *depot, char *password, size_t hard, size_t soft,
       time_t duration, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
-void set_ibp_proxy_modify_alloc_op(ibp_op_t *op, ibp_cap_t *cap, ibp_cap_t *mcap, size_t offset, size_t size, time_t duration,
+void set_ibp_alias_modify_alloc_op(ibp_op_t *op, ibp_cap_t *cap, ibp_cap_t *mcap, size_t offset, size_t size, time_t duration,
      int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
-ibp_op_t *new_ibp_proxy_modify_alloc_op(ibp_cap_t *cap, ibp_cap_t *mcap, size_t offset, size_t size, time_t duration,
+ibp_op_t *new_ibp_alias_modify_alloc_op(ibp_cap_t *cap, ibp_cap_t *mcap, size_t offset, size_t size, time_t duration,
      int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
 void set_ibp_depot_inq_op(ibp_op_t *op, ibp_depot_t *depot, char *password, ibp_depotinfo_t *di, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
 ibp_op_t *new_ibp_depot_inq_op(ibp_depot_t *depot, char *password, ibp_depotinfo_t *di, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc);
@@ -264,6 +274,8 @@ ibp_op_t *ibp_get_failed_op(oplist_t *oplist);
 ibp_op_t *ibp_waitany(oplist_t *iolist);
 
 //** ibp_config.c **
+void ibp_set_abort_attempts(int n);
+int  ibp_get_abort_attempts();
 void ibp_set_tcpsize(int n);
 int  ibp_get_tcpsize();
 void ibp_set_min_depot_threads(int n);

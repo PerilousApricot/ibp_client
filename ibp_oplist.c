@@ -35,9 +35,6 @@ http://www.accre.vanderbilt.edu
 #include "ibp.h"
 #include "host_portal.h"
 
-//#define lock_oplist(opl)   pthread_mutex_lock(&(opl->lock))
-//#define unlock_oplist(opl) pthread_mutex_unlock(&(opl->lock))
-
 oplist_base_op_t *_ibp_get_base_op(void *op);
 void _ibp_op_finalize(void *op);
 void _ibp_op_free(void *op);

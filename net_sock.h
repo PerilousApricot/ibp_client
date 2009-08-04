@@ -35,14 +35,21 @@ http://www.accre.vanderbilt.edu
 
 #define N_BUFSIZE  1024
 
-#include <sys/select.h>
-#include <sys/time.h>
+//#include <sys/select.h>
+//#include <sys/time.h>
+#include <apr_network_io.h>
+#include <apr_poll.h>
 #include <pthread.h>
 #include "network.h"
 
 typedef struct {  //** Contains the private raw socket network fields
-  int fd;
+  apr_socket_t  *fd;
+  apr_sockaddr_t *sa;
+  apr_pollset_t *pollset;
+  apr_pollfd_t pfd;
+  apr_pool_t *mpool;
   int tcpsize;
+  int state;
 } network_sock_t;
 
 #ifdef __cplusplus
@@ -54,12 +61,12 @@ int sock_status(net_sock_t *sock);
 int sock_close(net_sock_t *sock);
 long int sock_write(net_sock_t *sock, const void *buf, size_t count, Net_timeout_t tm);
 long int sock_read(net_sock_t *sock, void *buf, size_t count, Net_timeout_t tm);
-int sock_connect(net_sock_t *sock, char *hostname, int port, Net_timeout_t timeout);
+int sock_connect(net_sock_t *sock, const char *hostname, int port, Net_timeout_t timeout);
 int sock_connection_request(net_sock_t *nsock, int timeout);
 net_sock_t *sock_accept(net_sock_t *nsock);
 int sock_bind(net_sock_t *nsock, char *address, int port);
 int sock_listen(net_sock_t *nsock, int max_pending);
-void ns_config_sock(NetStream_t *ns, int fd, int tcpsize);
+void ns_config_sock(NetStream_t *ns, int tcpsize);
 
 #ifdef __cplusplus
 }

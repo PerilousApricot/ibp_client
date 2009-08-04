@@ -35,9 +35,11 @@ http://www.accre.vanderbilt.edu
 
 #define N_BUFSIZE  1024
 
-#include <sys/select.h>
-#include <sys/time.h>
-#include <pthread.h>
+#include <apr_network_io.h>
+#include <apr_thread_proc.h>
+#include <apr_thread_mutex.h>
+#include <apr_thread_cond.h>
+#include <apr_pools.h>
 #include "phoebus.h"
 #ifdef _ENABLE_PHOEBUS
 #include "liblsl_client.h"
@@ -70,9 +72,11 @@ extern "C" {
 #define NS_TYPE_1_SSL    2      //** Single SSL connection -- openssl/gnutls/NSS are not thread safe so this is **slow**
 #define NS_TYPE_2_SSL    3      //** Dual SSL connection -- Allows use of separate R/W locks over SSL much faster than prev
 
-typedef struct timeval Net_timeout_t;
+typedef apr_interval_time_t Net_timeout_t;
 
 typedef void net_sock_t;
+
+struct ns_monitor_s;   //** Forward declaration
 
 typedef struct {
    int id;                  //ID for tracking purposes
@@ -84,47 +88,45 @@ typedef struct {
    time_t last_read;        //Last time this connection was used
    time_t last_write;        //Last time this connection was used
    char buffer[N_BUFSIZE];  //intermediate buffer for the conection
-   pthread_mutex_t read_lock;    //Read lock
-   pthread_mutex_t write_lock;   //Write lock
+   apr_thread_mutex_t *read_lock;    //Read lock
+   apr_thread_mutex_t *write_lock;   //Write lock
    char peer_address[128];
+   struct ns_monitor_s *nm;      //THis is only used for an accept call to tell which bind was accepted
    int (*close)(net_sock_t *sock);  //** Close socket
    long int(*write)(net_sock_t *sock, const void *buf, size_t count, Net_timeout_t tm);
    long int (*read)(net_sock_t *sock, void *buf, size_t count, Net_timeout_t tm);
    void (*set_peer)(net_sock_t *sock, char *address, int add_size);
    int (*sock_status)(net_sock_t *sock);
-   int (*connect)(net_sock_t *sock, char *hostname, int port, Net_timeout_t timeout);
+   int (*connect)(net_sock_t *sock, const char *hostname, int port, Net_timeout_t timeout);
    net_sock_t *(*accept)(net_sock_t *sock);
    int (*bind)(net_sock_t *sock, char *address, int port);
    int (*listen)(net_sock_t *sock, int max_pending);
    int (*connection_request)(net_sock_t *sock, int timeout);
 } NetStream_t;
 
-typedef struct {   //** Struct used to handle ports being monitored
+typedef struct ns_monitor_s {   //** Struct used to handle ports being monitored
    NetStream_t *ns;       //** Connection actually being monitored
    char *address;         //** Interface to bind to
    int port;              //** Port to use
    int is_pending;        //** Flags the connections as ready for an accept call
    int shutdown_request;  //** Flags the connection to shutdown
-   pthread_t thread;      //** Execution thread handle
-   pthread_mutex_t lock;  //** Lock used for blocking pending accept
-   pthread_cond_t cond;   //** cond used for blocking pending accept
-   pthread_mutex_t *trigger_lock;  //** Lock used for sending globabl pending trigger 
-   pthread_cond_t *trigger_cond;   //** cond used for sending globabl pending accept
+   apr_thread_t *thread;  //** Execution thread handle
+   apr_pool_t *mpool;     //** Memory pool for the thread
+   apr_thread_mutex_t *lock;  //** Lock used for blocking pending accept
+   apr_thread_cond_t *cond;   //** cond used for blocking pending accept
+   apr_thread_mutex_t *trigger_lock; //** Lock used for sending globabl pending trigger 
+   apr_thread_cond_t *trigger_cond;   //** cond used for sending globabl pending accept
    int *trigger_count;             //** Gloabl count of pending requests
 } ns_monitor_t;
 
 typedef struct {
-   int max_connections;     //Max number of simultaneous connections 
-   int cuid_counter;        //Uniq id counter for all connections
    int trigger;             //Trigger used to wake up the network
    int accept_pending;      //New connection is pending
-   int min_idle;            //Min idle time an active connection has with no activity before being possibly being severed
    int used_ports;          //Number of monitor ports used
+   int monitor_index;       //Last ns checked in accept polling
    ns_monitor_t nm[NETWORK_MON_MAX];  //List of ports being monitored
-   pthread_mutex_t ns_lock; //Lock for serializing ns modifications
-   pthread_cond_t cond;   //** cond used for blocking pending accept
-   char *address;           //Address to bind to
-   int port;                //and port
+   apr_thread_mutex_t *ns_lock; //Lock for serializing ns modifications
+   apr_thread_cond_t *cond;   //** cond used for blocking pending accept
 } Network_t;
 
 #define ns_getid(ns) ns->id
@@ -138,16 +140,18 @@ int wait_for_connection(Network_t *net, int max_wait);
 void lock_ns(NetStream_t *ns);
 void unlock_ns(NetStream_t *ns);
 int network_counter(Network_t *net);
-int net_connect(NetStream_t *ns, char *host, int port, Net_timeout_t timeout);
+int net_connect(NetStream_t *ns, const char *host, int port, Net_timeout_t timeout);
 int bind_server_port(Network_t *net, NetStream_t *ns, char *address, int port, int max_pending);
-Network_t *network_init(char *address, int port, int max_pending);
+Network_t *network_init();
 void close_netstream(NetStream_t *ns);
 void destroy_netstream(NetStream_t *ns);
 NetStream_t *new_netstream();
 void network_close(Network_t *net);
+void network_destroy(Network_t *net);
 int sniff_connection(NetStream_t *ns);
 int write_netstream(NetStream_t *ns, const char *buffer, int bsize, Net_timeout_t timeout);
 int write_netstream_block(NetStream_t *ns, time_t end_time, char *buffer, int size);
+int read_netstream_block(NetStream_t *ns, time_t end_time, char *buffer, int size);
 int read_netstream(NetStream_t *ns, char *buffer, int size, Net_timeout_t timeout);
 int readline_netstream_raw(NetStream_t *ns, char *buffer, int size, Net_timeout_t timeout, int *status);
 int readline_netstream(NetStream_t *ns, char *buffer, int size, Net_timeout_t timeout);
@@ -155,6 +159,7 @@ int accept_pending_connection(Network_t *net, NetStream_t *ns);
 Net_timeout_t *set_net_timeout(Net_timeout_t *tm, int sec, int us);
 void ns_init(NetStream_t *ns);
 void _ns_init(NetStream_t *ns, int incid);
+void wakeup_network(Network_t *net);
 
 #ifdef __cplusplus
 }

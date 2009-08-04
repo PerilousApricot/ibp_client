@@ -29,6 +29,8 @@ http://www.accre.vanderbilt.edu
 
 #include <stdlib.h>
 #include <string.h>
+#include <apr_pools.h>
+#include <apr_thread_proc.h>
 #include "ibp.h"
 #include "ibp_misc.h"
 #include "host_portal.h"
@@ -40,7 +42,7 @@ http://www.accre.vanderbilt.edu
 // iovec_sync_thread - Actual routine that performs the I/O
 //*************************************************************
 
-void *iovec_sync_thread(void *data)
+void *iovec_sync_thread(apr_thread_t *th, void *data)
 {
   oplist_t *oplist = (oplist_t *)data;
   ibp_op_t *op;
@@ -147,6 +149,7 @@ void *iovec_sync_thread(void *data)
 
   log_printf(1, "iovec_sync_thread: Total commands processed: %d\n", cmd_count);
 
+  apr_thread_exit(th, 0);
   return(NULL);
 }
 
@@ -156,8 +159,9 @@ void *iovec_sync_thread(void *data)
 
 int ibp_sync_execute(oplist_t *oplist, int nthreads)
 {
-  pthread_t thread[nthreads];
-  void *dummy;
+  apr_thread_t *thread[nthreads];
+  apr_pool_t *mpool;
+  apr_status_t dummy;
   int i;
 
   log_printf(15, "ibp_sync_execute: Start! ncommands=%d\n", stack_size(oplist->list));
@@ -166,17 +170,19 @@ int ibp_sync_execute(oplist_t *oplist, int nthreads)
   move_to_top(oplist->list);
   unlock_oplist(oplist); 
 
+  apr_pool_create(&mpool, NULL);  //** Create the memory pool
     //** launch the threads **
   for (i=0; i<nthreads; i++) {
-     pthread_create(&(thread[i]), NULL, iovec_sync_thread, (void *)oplist);
+     apr_thread_create(&(thread[i]), NULL, iovec_sync_thread, (void *)oplist, mpool);
   }
 
   //** Wait for them to complete **
   for (i=0; i<nthreads; i++) {
-     pthread_join(thread[i], &dummy);
+     apr_thread_join(&dummy, thread[i]);
   }
 
-  
+  apr_pool_destroy(mpool);  //** Destroy the pool
+
   if (oplist_nfailed(oplist) == 0) {
      return(IBP_OK);
   } else {

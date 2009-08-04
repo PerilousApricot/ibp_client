@@ -46,6 +46,7 @@ http://www.accre.vanderbilt.edu
 #include <errno.h>
 #include <fcntl.h>
 #include "network.h"
+#include "net_fd.h"
 #include "debug.h"
 #include "log.h"
 #include "dns_cache.h"
@@ -55,12 +56,12 @@ http://www.accre.vanderbilt.edu
 // set_timeval - Initializes the timeval data structure
 //*********************************************************************
 
-struct timeval *set_timeval(struct timeval *tm, int sec, int us)
+struct timeval *set_timeval(struct timeval *tv, Net_timeout_t tm)
 {
-  tm->tv_sec = sec;
-  tm->tv_usec = us;
+  tv->tv_sec = tm / 1000000;
+  tv->tv_usec = tm % 1000000;
 
-  return(tm);
+  return(tv);
 }
 
 //*********************************************************************
@@ -76,7 +77,8 @@ int fd_connection_request(int fd, int timeout)
 
   if (fd == -1) return(-1);
 
-  set_timeval(&dt, timeout, 0);
+  dt.tv_sec = timeout;
+  dt.tv_usec = 0;
   FD_ZERO(&rfd);  FD_SET(fd, &rfd);
   return(select(fd+1, &rfd, NULL, NULL, &dt));
 }
@@ -228,7 +230,8 @@ long int fd_write(int fd, const void *buf, size_t count, Net_timeout_t tm)
   long int n;
   int err;
   fd_set wfd;
-
+  struct timeval tv;
+  
   if (fd == -1) return(-1);   //** If closed return
 
   n = write(fd, buf, count);
@@ -240,7 +243,8 @@ log_printf(15, "fd_write: fd=%d n=%ld errno=%d\n", fd, n, errno);
      FD_ZERO(&wfd);
      FD_SET(fd, &wfd);
 
-     err = select(fd+1, NULL, &wfd, NULL, &tm);
+     set_timeval(&tv, tm);
+     err = select(fd+1, NULL, &wfd, NULL, &tv);
      if (err > 0) {
         n = write(fd, buf, count);
 log_printf(15, "fd_write2: fd=%d n=%ld select=%d errno=%d\n", fd, n, err,errno);
@@ -264,6 +268,7 @@ long int fd_read(int fd, void *buf, size_t count, Net_timeout_t tm)
   long int n;
   int err;
   fd_set rfd;
+  struct timeval tv;
 
   if (fd == -1) return(-1);   //** If closed return
 
@@ -275,7 +280,8 @@ log_printf(15, "fd_read: fd=%d n=%ld errno=%d\n", fd, n, errno);
      FD_ZERO(&rfd);
      FD_SET(fd, &rfd);
 
-     err = select(fd+1, &rfd, NULL, NULL, &tm);
+     set_timeval(&tv, tm);
+     err = select(fd+1, &rfd, NULL, NULL, &tv);
      if (err > 0) {
         n = read(fd, buf, count);
 log_printf(15, "fd_read2: fd=%d n=%ld select=%d errno=%d\n", fd, n, err,errno);
@@ -294,7 +300,7 @@ log_printf(15, "fd_read2: fd=%d n=%ld select=%d errno=%d\n", fd, n, err,errno);
 // fd_connect - Creates a connection to a remote host
 //*********************************************************************
 
-int fd_connect(int *fd, char *hostname, int port, int tcpsize, Net_timeout_t timeout)
+int fd_connect(int *fd, const char *hostname, int port, int tcpsize, Net_timeout_t timeout)
 {
    struct sockaddr_in addr;
    char in_addr[6];
@@ -302,15 +308,20 @@ int fd_connect(int *fd, char *hostname, int port, int tcpsize, Net_timeout_t tim
    fd_set wfd;
    time_t endtime;
    Net_timeout_t to;
+   struct timeval tv;
 
    log_printf(15, "fd_connect: Trying to make connection to Hostname: %s  Port: %d\n", hostname, port);
 
    *fd = -1;
+   if (hostname == NULL) {
+      log_printf(15, "fd_connect: lookup_host failed.  Missing hostname!  Port: %d\n",port);
+      return(1);
+   }
 
    // Get ip address
    if (lookup_host(hostname, in_addr) != 0) {
       log_printf(15, "fd_connect: lookup_host failed.  Hostname: %s  Port: %d\n", hostname, port);
-      return(1);;
+      return(1);
    }
    
    // get the socket
@@ -359,13 +370,14 @@ int fd_connect(int *fd, char *hostname, int port, int tcpsize, Net_timeout_t tim
    }
 
 
-   log_printf(20, "fd_connect: Before select timeout=%lu time=" TT "\n", timeout.tv_sec, time(NULL));
+   log_printf(20, "fd_connect: Before select time=" TT "\n", time(NULL));
    endtime = time(NULL) + 5;
    do {
       FD_ZERO(&wfd);
       FD_SET(sfd, &wfd);
       set_net_timeout(&to, 1, 0);
-      err = select(sfd+1, NULL, &wfd, NULL, &to);
+      set_timeval(&tv, to);
+      err = select(sfd+1, NULL, &wfd, NULL, &tv);
       log_printf(20, "fd_connect: After select err=%d\n", err);
       if (err != 1) {
          if (errno != EINPROGRESS) {

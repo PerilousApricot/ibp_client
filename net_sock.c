@@ -31,13 +31,15 @@ http://www.accre.vanderbilt.edu
 //*********************************************************************
 
 #include <sys/types.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
-#include <sys/uio.h>
-#include <netdb.h>
-#include <unistd.h>
+//#include <sys/socket.h>
+//#include <netinet/in.h>
+//#include <netinet/tcp.h>
+//#include <arpa/inet.h>
+//#include <sys/uio.h>
+//#include <netdb.h>
+//#include <unistd.h>
+#include <apr_network_io.h>
+#include <apr_poll.h>
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
@@ -51,7 +53,7 @@ http://www.accre.vanderbilt.edu
 #include "dns_cache.h"
 #include "fmttypes.h"
 #include "net_sock.h"
-#include "net_fd.h"
+//#include "net_fd.h"
 
 //*********************************************************************
 // sock_set_peer - Gets the remote sockets hostname 
@@ -60,8 +62,13 @@ http://www.accre.vanderbilt.edu
 void sock_set_peer(net_sock_t *nsock, char *address, int add_size)
 {
    network_sock_t *sock = (network_sock_t *)nsock;   
+   apr_sockaddr_t *sa;
 
-   fd_set_peer(sock->fd, address, add_size);
+   address[0] = '\0';
+   if (sock == NULL) return;
+
+   if (apr_socket_addr_get(&sa, APR_REMOTE, sock->fd) != APR_SUCCESS) return;
+   apr_sockaddr_ip_getbuf(address, add_size, sa);
 
    return;
 }
@@ -75,7 +82,7 @@ int sock_status(net_sock_t *nsock)
   network_sock_t *sock = (network_sock_t *)nsock;   
   if (sock == NULL) return(0);
 
-  return(fd_status(sock->fd));
+  return(1);
 }
 
 //*********************************************************************
@@ -87,15 +94,16 @@ int sock_close(net_sock_t *nsock)
   network_sock_t *sock = (network_sock_t *)nsock;   
 
   if (sock == NULL) return(0);
-  if (sock->fd == -1) return(0);
 
-log_printf(15, "sock_close: closing fd=%d\n", sock->fd); 
+//log_printf(15, "sock_close: closing fd=%d\n", sock->fd); 
 
-  int err = close(sock->fd);
+  apr_socket_close(sock->fd);
+  if (sock->pollset != NULL) apr_pollset_destroy(sock->pollset);
+  apr_pool_destroy(sock->mpool);
 
   free(sock);
 
-  return(err);
+  return(0);
 }
 
 //*********************************************************************
@@ -104,11 +112,20 @@ log_printf(15, "sock_close: closing fd=%d\n", sock->fd);
 
 long int sock_write(net_sock_t *nsock, const void *buf, size_t count, Net_timeout_t tm)
 {
+  int err;
+  apr_size_t nbytes;
   network_sock_t *sock = (network_sock_t *)nsock;   
 
-  if (sock == NULL) return(-1);   //** If closed return
+//if (sock == NULL) log_printf(15, "sock_write: sock == NULL\n");
 
-  return(fd_write(sock->fd, buf, count, tm));
+  if (sock == NULL) return(-1);   //** If closed return
+  
+  apr_socket_timeout_set(sock->fd, tm);
+  nbytes = count;  
+  err = apr_socket_send(sock->fd, buf, &nbytes);
+  if ((err != APR_SUCCESS) && (err != APR_TIMEUP)) nbytes = -1;
+//log_printf(15, "sock_write: count=" ST " nbytes=%ld\n", count, nbytes);
+  return(nbytes);
 }
 
 //*********************************************************************
@@ -117,24 +134,56 @@ long int sock_write(net_sock_t *nsock, const void *buf, size_t count, Net_timeou
 
 long int sock_read(net_sock_t *nsock, void *buf, size_t count, Net_timeout_t tm)
 {
+  int err;
+  apr_size_t nbytes;
   network_sock_t *sock = (network_sock_t *)nsock;   
 
   if (sock == NULL) return(-1);   //** If closed return
 
-  return(fd_read(sock->fd, buf, count, tm));
+  apr_socket_timeout_set(sock->fd, tm);
+  nbytes = count;  
+  err = apr_socket_recv(sock->fd, buf, &nbytes);
+  if ((err != APR_SUCCESS) && (err != APR_TIMEUP)) nbytes = -1;
+
+//log_printf(15, "sock_read: count=" ST " nbytes=%ld err=%d\n", count, nbytes, err);
+  return(nbytes);
 }
 
 //*********************************************************************
 // sock_connect - Creates a connection to a remote host
 //*********************************************************************
 
-int sock_connect(net_sock_t *nsock, char *hostname, int port, Net_timeout_t timeout)
-{
+int sock_connect(net_sock_t *nsock, const char *hostname, int port, Net_timeout_t timeout)
+{  
+   int err;
    network_sock_t *sock = (network_sock_t *)nsock;   
 
    if (sock == NULL) return(-1);   //** If NULL exit
 
-   return(fd_connect(&(sock->fd), hostname, port, sock->tcpsize, timeout));
+   if (sock->fd != NULL) apr_socket_close(sock->fd);
+  
+   sock->sa = NULL;
+//log_printf(0, " sock_connect: hostname=%s:%d\n", hostname, port);
+//   err = apr_sockaddr_info_get(&(sock->sa), hostname, APR_INET, port, APR_IPV4_ADDR_OK, sock->mpool);
+   err = apr_sockaddr_info_get(&(sock->sa), hostname, APR_INET, port, 0, sock->mpool);
+//log_printf(0, "sock_connect: apr_sockaddr_info_get: err=%d\n", err);
+//if (sock->sa == NULL) log_printf(0, "sock_connect: apr_sockaddr_info_get: sock->sa == NULL\n");
+
+   if (err != APR_SUCCESS) return(err);
+   
+   err = apr_socket_create(&(sock->fd), APR_INET, SOCK_STREAM, APR_PROTO_TCP, sock->mpool);
+//log_printf(0, "sock_connect: apr_sockcreate: err=%d\n", err);
+   if (err != APR_SUCCESS) return(err);
+
+   
+//   apr_socket_opt_set(sock->fd, APR_SO_NONBLCK, 1);
+   apr_socket_timeout_set(sock->fd, timeout);
+   if (sock->tcpsize > 0) {
+      apr_socket_opt_set(sock->fd, APR_SO_SNDBUF, sock->tcpsize);
+      apr_socket_opt_set(sock->fd, APR_SO_RCVBUF, sock->tcpsize);
+   }
+
+   return(apr_socket_connect(sock->fd, sock->sa));
 }
 
 //*********************************************************************
@@ -145,11 +194,20 @@ int sock_connect(net_sock_t *nsock, char *hostname, int port, Net_timeout_t time
 
 int sock_connection_request(net_sock_t *nsock, int timeout)
 {
+  apr_int32_t n;
+  const apr_pollfd_t *ret_fd;
+
   network_sock_t *sock = (network_sock_t *)nsock;   
 
   if (sock == NULL) return(-1);
 
-  return(fd_connection_request(sock->fd, timeout));
+  int err = apr_pollset_poll(sock->pollset, timeout*1000000, &n, &ret_fd);
+  if (err == APR_SUCCESS) {
+     return(1);
+  } else {
+     return(0);
+  }
+  return(-1);
 }
 
 //*********************************************************************
@@ -158,13 +216,16 @@ int sock_connection_request(net_sock_t *nsock, int timeout)
 
 net_sock_t *sock_accept(net_sock_t *nsock)
 {
+  int err;
   network_sock_t *psock = (network_sock_t *)nsock;   
 
   network_sock_t *sock = (network_sock_t *)malloc(sizeof(network_sock_t));
   assert(sock != NULL);
 
-  sock->fd = fd_accept(psock->fd);
-  if (sock->fd == -1) {
+  memset(sock, 0, sizeof(network_sock_t));
+
+  err = apr_socket_accept(&(sock->fd), psock->fd, sock->mpool);
+  if (err != APR_SUCCESS) {
      free(sock);
      sock = NULL;
   }
@@ -178,14 +239,26 @@ net_sock_t *sock_accept(net_sock_t *nsock)
 
 int sock_bind(net_sock_t *nsock, char *address, int port)
 {
+  int err;
   network_sock_t *sock = (network_sock_t *)nsock;   
 
   if (sock == NULL) return(1);
 
-  sock->fd = fd_bind(address, port);
-  if (sock->fd < 0) return(1);
+   err = apr_sockaddr_info_get(&(sock->sa), address, APR_INET, port, APR_IPV4_ADDR_OK, sock->mpool);
+   if (err != APR_SUCCESS) return(err);
+   
+   err = apr_socket_create(&(sock->fd), APR_INET, SOCK_STREAM, APR_PROTO_TCP, sock->mpool);
+   if (err != APR_SUCCESS) return(err);
 
-  return(0);
+   apr_socket_opt_set(sock->fd, APR_SO_NONBLOCK, 1);
+   if (sock->tcpsize > 0) {
+      apr_socket_opt_set(sock->fd, APR_SO_SNDBUF, sock->tcpsize);
+      apr_socket_opt_set(sock->fd, APR_SO_RCVBUF, sock->tcpsize);
+   }
+
+  err = apr_socket_bind(sock->fd, sock->sa);
+
+  return(err);
 }
 
 //*********************************************************************
@@ -194,11 +267,27 @@ int sock_bind(net_sock_t *nsock, char *address, int port)
 
 int sock_listen(net_sock_t *nsock, int max_pending)
 {
+  int err;
   network_sock_t *sock = (network_sock_t *)nsock;   
 
   if (sock == NULL) return(1);
 
-  return(fd_listen(sock->fd, max_pending));
+  err = apr_socket_listen(sock->fd, max_pending);
+  if (err != APR_SUCCESS) return(err);
+
+  //** Create the polling info
+  apr_pollset_create(&(sock->pollset), 1, sock->mpool, 0);
+//  sock->pfd = { sock->mpool, APR_POLL_SOCKET, APR_POLLIN, 0, { NULL }, NULL };
+  sock->pfd.p = sock->mpool;
+  sock->pfd.desc_type = APR_POLL_SOCKET;
+  sock->pfd.reqevents = APR_POLLIN;
+  sock->pfd.rtnevents = 0;
+  sock->pfd.desc.s = sock->fd;
+  sock->pfd.client_data = NULL;
+
+  apr_pollset_add(sock->pollset, &(sock->pfd));
+
+  return(0);
 }
 
 
@@ -206,17 +295,21 @@ int sock_listen(net_sock_t *nsock, int max_pending)
 // ns_config_sock - Configure the connection to use standard sockets 
 //*********************************************************************
 
-void ns_config_sock(NetStream_t *ns, int fd, int tcpsize)
+void ns_config_sock(NetStream_t *ns, int tcpsize)
 {
-  log_printf(10, "ns_config_sock: ns=%d, fd=%d\n", ns->id, fd);
+  log_printf(10, "ns_config_sock: ns=%d, \n", ns->id);
 
   _ns_init(ns, 0);
 
   ns->sock_type = NS_TYPE_SOCK;
   network_sock_t *sock = (network_sock_t *)malloc(sizeof(network_sock_t));
   assert(sock != NULL);
+  memset(sock, 0, sizeof(network_sock_t));
   ns->sock = (net_sock_t *)sock;
-  sock->fd = fd;
+  if (apr_pool_create(&(sock->mpool), NULL) != APR_SUCCESS) {
+     return; 
+  }
+  
   sock->tcpsize = tcpsize;
   ns->connect = sock_connect;
   ns->sock_status = sock_status;

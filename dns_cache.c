@@ -34,180 +34,163 @@ http://www.accre.vanderbilt.edu
 //**************************************************************************
 
 #include <pthread.h>
-#include <dns_cache.h>
 #include <assert.h>
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <apr_hash.h>
+#include <apr_network_io.h>
 
 #include "log.h"
 #include "fmttypes.h"
+#include "dns_cache.h"
+#include "string_token.h"
 
 #define BUF_SIZE 128
-#define ADDR_LEN 4
+
 typedef struct {
    char name[BUF_SIZE];
-   char addr[ADDR_LEN];
-   int  count;
+   unsigned char addr[DNS_ADDR_MAX];
+   char ip_addr[256];
+   int family;
 } DNS_entry_t;
 
 typedef struct {
-   DNS_entry_t *list;
+   apr_pool_t *mpool;
+   apr_pool_t *lockpool;
+   apr_hash_t *table;
    int size;
-   long int count;
-   pthread_mutex_t mutex;
+   time_t restart_time;
+   apr_thread_mutex_t *lock;
 } DNS_cache_t;
 
-DNS_cache_t *_cache;
-
-#ifdef _DARWIN
-int gethostbyname2_r (const char *name, int af,
-         struct hostent *ret, char *buf, size_t buflen,
-         struct hostent **result, int *h_errnop) {
+DNS_cache_t *_cache = NULL;
 
 
-    struct hostent *h;
+//**************************************************************************
+//  wipe_entries - Wipes the existing entries and resets the timer
+//**************************************************************************
 
-    h = gethostbyname2(name, af);
-    if (h == NULL) {
-       return(1);
-    } else {
-       memcpy(ret, h, sizeof(struct hostent));
-       *result = ret;
-       return(0);
-    }
-   
+void wipe_entries(DNS_cache_t *cache)
+{
+  if (cache->mpool != NULL) apr_pool_destroy(cache->mpool);
+
+  assert(apr_pool_create(&(cache->mpool), NULL) == APR_SUCCESS);
+  assert((cache->table = apr_hash_make(cache->mpool)) != NULL);
+  
+  cache->restart_time = time(NULL) + 600;
 }
-
-#endif
 
 //**************************************************************************
 //  lookup_host - Looks up the host.  Make sure that the lock/unlock routines
 //      are used to make it threadsafe!
+//
 //**************************************************************************
    
-int lookup_host(char *name, char *addr) {
-  int i, oldest_slot, slot;
-  long int oldest_count;
-  DNS_entry_t *list;
-  int retcode;
+int lookup_host(const char *name, char *byte_addr, char *ip_addr) {
+  char ip_buffer[256];
+//  char byte_buffer[256];
+  char *s, *bstate;
+  int err, i;
+  DNS_entry_t *h;
+  apr_sockaddr_t *sa;
+  int family;
 
-log_printf(20, "lookup_host: start time=" TT "\n", time(NULL));
+log_printf(20, "lookup_host: start time=" TT " name=%s\n", time(NULL), name);
+if (_cache == NULL) log_printf(20, "lookup_host: _cache == NULL\n");
 
   if (name[0] == '\0') return(1);  //** Return early if name is NULL
 
-  pthread_mutex_lock(&(_cache->mutex));
+//  ipaddr = (ip_addr == NULL) ? ip_buffer : ip_addr;
+//  addr = (byte_addr == NULL) ? byte_buffer : byte_addr;
+  
+//log_printf(20, "lookup_host: before lock\n");
+  apr_thread_mutex_lock(_cache->lock);
+//log_printf(20, "lookup_host: after lock\n");
  
-  bzero(addr,ADDR_LEN);
+  if ((time(NULL) > _cache->restart_time) || (apr_hash_count(_cache->table) > _cache->size)) wipe_entries(_cache);
+  
+  h = (DNS_entry_t *)apr_hash_get(_cache->table, name, APR_HASH_KEY_STRING);
 
-  retcode = 1;
-
-  _cache->count++;
-
-  list = _cache->list;
-
-  i = 0;  oldest_slot = 0; oldest_count = list[i].count;
-  while ((i<(_cache->size-1)) && (strcmp(name, list[i].name) != 0)) {
-     i++;
-     if (oldest_count > list[i].count) {
-        oldest_slot = i;
-        oldest_count = list[i].count;
-     }
+  if (h != NULL) {  //** Got a hit!!
+     if (ip_addr != NULL) strcpy(ip_addr, h->ip_addr);
+     if (byte_addr != NULL) memcpy(byte_addr, h->addr, DNS_ADDR_MAX);
+     family = h->family;
+     apr_thread_mutex_unlock(_cache->lock);
+     return(0);
   }
+  
+  //** If we made it here that means we have to look it up
+  err = apr_sockaddr_info_get(&sa, name, APR_INET, 80, 0, _cache->mpool);
+//log_printf(20, "lookup_host: apr_sockaddr_info_get=%d\n", err);
 
-  if (strcmp(name, list[i].name) == 0) {  //*** Found it!
-     list[i].count = _cache->count;
-     memcpy(addr,&(list[i].addr), ADDR_LEN);
-     retcode = 0;
-     log_printf(20, "lookup_host: Found %s in cache slot %d  (%s) \n", name, i, list[i].name);
-     log_printf(20, "lookup_host: Found %s in cache slot %d  (%s,%hhu.%hhu.%hhu.%hhu)\n", name, i, list[i].name, 
-             list[i].addr[0],list[i].addr[1],list[i].addr[2],list[i].addr[3]); 
-     //flush_log();
-
-  } else {   //*** Got to add it
-     char buf[10000];
-     struct hostent hostbuf, *host;
-     int err;
-
-     memset(&hostbuf, 0, sizeof(struct hostent));
-
-     slot = oldest_slot;
-
-     log_printf(10, "lookup_host:  Before gethostbyname Hostname: %s\n", name); flush_log();
-     i = gethostbyname2_r(name, AF_INET, &hostbuf, buf, 10000, &host, &err);
-     log_printf(10, "lookup_host:  Hostname: %s  err=%d\n", name, err);
-//     n = 0; 
-//     while (!host && (n<4)) {
-//        log_printf(10, "lookup_host gethostbyname failed.  Hostname: %s  err=%d\n", name, err);
-//        sleep(1);
-//        i = gethostbyname2_r(name, AF_INET, &hostbuf, buf, 10000, &host, &err);
-//        n++;
-//     }
-
-     if (host) {  //** Got it
-        list[slot].count = _cache->count;
-        strncpy(list[slot].name, name, BUF_SIZE);
-        list[slot].name[BUF_SIZE-1] = '\0';
-        memcpy(addr,host->h_addr, ADDR_LEN);
-        memcpy(&(list[slot].addr),host->h_addr, host->h_length);
-        log_printf(15, "lookup_host: Added %s to slot %d  (%s,%hhu.%hhu.%hhu.%hhu) h_len=%d\n", name, slot, host->h_name, 
-             list[slot].addr[0],list[slot].addr[1],list[slot].addr[2],list[slot].addr[3], host->h_length);
-        retcode = 0;
-     } else {
-      log_printf(10, "lookup_host: %s not found!\n", name);
-     }
+  if (err != APR_SUCCESS) {
+    apr_thread_mutex_unlock(_cache->lock);
+    return(-1);
   }
+  h = (DNS_entry_t *)apr_palloc(_cache->mpool, sizeof(DNS_entry_t)); //** This is created withthe pool for easy cleanup
+  memset(h, 0, sizeof(DNS_entry_t));
 
-  if (_cache->count == LONG_MAX) {  //*** Got to renumber the counts
-    _cache->count = 0;
-    for (i=0; i<_cache->size; i++) {  //This is nonoptimal but shouldn't matter
-        if (list[i].count > 0) list[i].count = _cache->count++;
-    }  
+  strncpy(h->name, name, sizeof(h->name));  h->name[sizeof(h->name)-1] = '\0';
+
+  apr_sockaddr_ip_getbuf(ip_buffer, sizeof(ip_buffer), sa);
+  strcpy(h->ip_addr, ip_buffer);
+  
+log_printf(20, "lookup_host: start host=%s address=%s\n", name, ip_buffer);
+
+  h->family = DNS_IPV4;
+  i = 0;
+  for (s = string_token(ip_buffer, ".", &bstate, &err); err == 0; s = string_token(NULL, ".", &bstate, &err)) {
+      h->addr[i] = atoi(s);
+//n = h->addr[i];
+//log_printf(20, "lookup_host: err=%d i=%d n=%d s=%s\n", err, i, n, s);
+
+      i++;
   }
+  if (i>4) h->family = DNS_IPV6;
 
-  pthread_mutex_unlock(&(_cache->mutex));
+  //** Add the enry to the table
+  apr_hash_set(_cache->table, h->name, APR_HASH_KEY_STRING, h);
 
-log_printf(20, "lookup_host: end time=" TT "\n", time(NULL));
+  //** Return the address
+  if (ip_addr != NULL) strcpy(ip_addr, h->ip_addr);
+  if (byte_addr != NULL) memcpy(byte_addr, h->addr, DNS_ADDR_MAX);
+  family = h->family;
 
-  return(retcode);
+  apr_thread_mutex_unlock(_cache->lock);
+
+  return(0);
 }
 
 //**************************************************************************
 
 void dns_cache_init(int size) {
-   int i;
-
    log_printf(20, "dns_cache_init: Start!!!!!!!!!!!!\n");
+
+   if (_cache != NULL) return;
 
    _cache = (DNS_cache_t *)malloc(sizeof(DNS_cache_t));
    assert(_cache != NULL);
 
-   _cache->list = (DNS_entry_t *)malloc(sizeof(DNS_entry_t)*size);
-   assert(_cache->list != NULL);
-
-   _cache->count = 0;
    _cache->size = size;
-
-   for (i=0; i<size; i++) {
-       _cache->list[i].count = -1;
-       _cache->list[i].name[0] = '\0';
-   }
-
-  pthread_mutex_init(&(_cache->mutex), NULL);
-  pthread_mutex_unlock(&(_cache->mutex));
-
-   log_printf(20, "dns_cache_init: End!!!!!!!!!!!!\n");
-
-  return;
+   _cache->mpool = NULL;
+   assert(apr_pool_create(&(_cache->lockpool), NULL) == APR_SUCCESS);
+   apr_thread_mutex_create(&(_cache->lock), APR_THREAD_MUTEX_DEFAULT,_cache->lockpool);
+  
+   wipe_entries(_cache);
 }
 
 //**************************************************************************
 
 void finalize_dns_cache() {
-   free(_cache->list);
-   free(_cache);
+  apr_thread_mutex_destroy(_cache->lock);
+
+  if (_cache->mpool != NULL) apr_pool_destroy(_cache->mpool);
+  if (_cache->lockpool != NULL) apr_pool_destroy(_cache->lockpool);
+
+  free(_cache);
 }
 
 

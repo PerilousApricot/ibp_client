@@ -33,7 +33,11 @@ http://www.accre.vanderbilt.edu
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
-#include <glib.h>
+#include <apr_hash.h>
+#include <apr_pools.h>
+#include <apr_thread_proc.h>
+#include <apr_thread_mutex.h>
+#include <apr_thread_cond.h>
 #include "fmttypes.h"
 #include "network.h"
 #include "oplist.h"
@@ -79,8 +83,9 @@ typedef struct {  //** Hportal specific implementation
 } Hportal_impl_t;
 
 typedef struct {             //** Handle for maintaining all the ecopy connections
-  pthread_mutex_t lock;
-  GHashTable *table;         //** Table containing the depot_portal structs
+  apr_thread_mutex_t *lock;
+  apr_hash_t *table;         //** Table containing the depot_portal structs
+  apr_pool_t *pool;          //** Memory pool for hash table
   int running_threads;       //** currently running # of connections
   int max_connections;       //** Max aggregate allowed number of threads
   int min_threads;           //** Max allowed number of threads/host
@@ -88,6 +93,7 @@ typedef struct {             //** Handle for maintaining all the ecopy connectio
   int64_t max_workload;      //** Max allowed workload before spawning another connection
   int compact_interval;      //** Interval between garbage collections calls
   int wait_stable_time;      //** time to wait before adding connections for unstable hosts
+  int abort_conn_attempts;   //** If this many failed connection requests occur in a row we abort
   int check_connection_interval; //** Max time to wait for a thread to check for a close
   int min_idle;              //** Idle time before closing connection
   int max_retry;             //** Default max number of times to retry an op
@@ -110,6 +116,9 @@ typedef struct {       //** Contains information about the depot including all c
   int invalid_host;       //** Flag that this host is not resolvable
   int64_t workload;       //** Amount of work left in the feeder que
   int64_t cmds_processed; //** Number of commands processed
+  int failed_conn_attempts;     //** Failed net_connects()
+  int successful_conn_attempts; //** Successful net_connects()
+  int abort_conn_attempts; //** IF this many failed connection requests occur in a row we abort
   int n_conn;             //** Number of current depot connections
   int stable_conn;        //** Last count of "stable" connections
   int max_conn;           //** Max allowed connections, normally global_config->max_threads
@@ -119,8 +128,9 @@ typedef struct {       //** Contains information about the depot including all c
   Stack_t *que;           //** Task que
   Stack_t *closed_que;    //** List of closed but not reaped connections
   Stack_t *sync_list;     //** List of dedicated dportal/dc for the traditional IBP sync calls
-  pthread_mutex_t lock;  //** shared lock
-  pthread_cond_t  cond;  
+  apr_thread_mutex_t *lock;  //** shared lock
+  apr_thread_cond_t *cond;  
+  apr_pool_t *mpool;
   void *connect_context;   //** Private information needed to make a host connection
   Hportal_context_t *context;  //** Specific Hportal implementaion
 } Host_portal_t;
@@ -130,28 +140,29 @@ typedef struct {            //** Individual depot connection in conn_list
    int curr_workload;
    int shutdown_request;
    int net_connect_status;
-   time_t last_used;        //** Time the last command completed
-   NetStream_t *ns;         //** Socket 
-   Stack_t *pending_stack;  //** Local task que. An op  is mpoved from the parent que to here
-   Stack_ele_t *my_pos;     //** My position int the dp conn list
+   time_t last_used;          //** Time the last command completed
+   NetStream_t *ns;           //** Socket 
+   Stack_t *pending_stack;    //** Local task que. An op  is mpoved from the parent que to here
+   Stack_ele_t *my_pos;       //** My position int the dp conn list
    Hportal_stack_op_t *curr_op;   //** Sending phase op that could have failed
-   Host_portal_t *hp;      //** Pointerto parent depot portal with the todo list
-   pthread_t thread;        //** Thread data
-   pthread_mutex_t lock;    //** shared lock
-   pthread_cond_t send_cond;  
-   pthread_cond_t recv_cond;
-   pthread_t send_thread;     //** Sending thread
-   pthread_t recv_thread;     //** recving thread
+   Host_portal_t *hp;         //** Pointerto parent depot portal with the todo list
+//   apr_thread_t *thread;    //** Thread data
+   apr_thread_mutex_t *lock;      //** shared lock
+   apr_thread_cond_t *send_cond;  
+   apr_thread_cond_t *recv_cond;
+   apr_thread_t *send_thread; //** Sending thread
+   apr_thread_t *recv_thread; //** recving thread
+   apr_pool_t   *mpool;       //** MEmory pool for 
 } Host_connection_t;
 
 
 extern Net_timeout_t global_dt;
 
 //** Routines from hportal.c
-#define hportal_trylock(hp)   pthread_mutex_trylock(&(hp->lock))
-#define hportal_lock(hp)   pthread_mutex_lock(&(hp->lock))
-#define hportal_unlock(hp) pthread_mutex_unlock(&(hp->lock))
-#define hportal_signal(hp) pthread_cond_broadcast(&(hp->cond))
+#define hportal_trylock(hp)   apr_thread_mutex_trylock(hp->lock)
+#define hportal_lock(hp)   apr_thread_mutex_lock(hp->lock)
+#define hportal_unlock(hp) apr_thread_mutex_unlock(hp->lock)
+#define hportal_signal(hp) apr_thread_cond_broadcast(hp->cond)
 
 void hportal_wait(Host_portal_t *hp, int dt);
 int get_hpc_thread_count(Hportal_context_t *hpc);
@@ -173,22 +184,16 @@ int submit_hportal(Host_portal_t *dp, oplist_t *oplist, void *op, int addtotop);
 int submit_hp_op(Hportal_context_t *hpc, oplist_t *oplist, void *op);
 
 //** Routines for hconnection.c
-#define trylock_hc(a) pthread_mutex_trylock(&(a->lock))
-#define lock_hc(a) pthread_mutex_lock(&(a->lock))
-#define unlock_hc(a) pthread_mutex_unlock(&(a->lock))
-#define hc_send_signal(hc) pthread_cond_signal(&(hc->send_cond))
-#define hc_recv_signal(hc) pthread_cond_signal(&(hc->recv_cond))
+#define trylock_hc(a) apr_thread_mutex_trylock(a->lock)
+#define lock_hc(a) apr_thread_mutex_lock(a->lock)
+#define unlock_hc(a) apr_thread_mutex_unlock(a->lock)
+#define hc_send_signal(hc) apr_thread_cond_signal(hc->send_cond)
+#define hc_recv_signal(hc) apr_thread_cond_signal(hc->recv_cond)
 
 Host_connection_t *new_host_connection();
 void destroy_host_connection(Host_connection_t *hc);
 void close_hc(Host_connection_t *dc);
 int create_host_connection(Host_portal_t *hp);
-
-//** ibp_oplist.c **
-//#define lock_oplist(opl)   pthread_mutex_lock(&(opl->lock))
-//#define unlock_oplist(opl) pthread_mutex_unlock(&(opl->lock))
-//void ibp_oplist_mark_completed(oplist_t *oplist, ibp_op_t *op, int status);
-//void sort_oplist(oplist_t *iolist);
 
 #ifdef __cplusplus
 }

@@ -28,8 +28,8 @@ http://www.accre.vanderbilt.edu
 */ 
 
 
-#include <glib.h>
 #include <stdio.h>
+#include "iniparse.h"
 
 #ifndef __PHOEBUS_H
 #define __PHOEBUS_H
@@ -53,7 +53,7 @@ extern phoebus_t *global_phoebus;
 void phoebus_init(void);
 void phoebus_destroy(void);
 void phoebus_print(FILE *fd);
-void phoebus_load_config(GKeyFile *kf);
+void phoebus_load_config(inip_file_t *kf);
 void phoebus_path_set(phoebus_t *p, const char *path);
 void phoebus_path_destroy(phoebus_t *p);
 void phoebus_path_to_string(char *string, int max_size, phoebus_t *p);

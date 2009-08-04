@@ -30,28 +30,27 @@ http://www.accre.vanderbilt.edu
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <apr_pools.h>
+#include <apr_thread_proc.h>
+#include <apr_thread_mutex.h>
+#include <apr_thread_cond.h>
 #include "host_portal.h"
 #include "log.h"
 #include "network.h"
 
 //*************************************************************************
-//*************************************************************************
-
-//#define lock_hc(a) pthread_mutex_lock(a->lock)
-//#define unlock_hc(a) pthread_mutex_lock(a->lock)
-
-//*************************************************************************
 // new_host_connection - Allocates space for a new connection
 //*************************************************************************
 
-Host_connection_t *new_host_connection()
+Host_connection_t *new_host_connection(apr_pool_t *mpool)
 {
   Host_connection_t *hc;
   assert((hc = (Host_connection_t *)malloc(sizeof(Host_connection_t))) != NULL);
 
-  pthread_mutex_init(&(hc->lock), NULL);
-  pthread_cond_init(&(hc->send_cond), NULL);
-  pthread_cond_init(&(hc->recv_cond), NULL);
+  hc->mpool = mpool;
+  apr_thread_mutex_create(&(hc->lock), APR_THREAD_MUTEX_DEFAULT, mpool);
+  apr_thread_cond_create(&(hc->send_cond), mpool);
+  apr_thread_cond_create(&(hc->recv_cond), mpool);
   hc->pending_stack = new_stack();
   hc->cmd_count = 0;
   hc->curr_workload = 0;
@@ -72,6 +71,10 @@ void destroy_host_connection(Host_connection_t *hc)
 {
   destroy_netstream(hc->ns);
   free_stack(hc->pending_stack, 0);
+  apr_thread_mutex_destroy(hc->lock);
+  apr_thread_cond_destroy(hc->send_cond);
+  apr_thread_cond_destroy(hc->recv_cond);
+  apr_pool_destroy(hc->mpool);
   free(hc);
 }
 
@@ -81,7 +84,7 @@ void destroy_host_connection(Host_connection_t *hc)
 
 void close_hc(Host_connection_t *hc)
 {
-  void *ptr;
+  apr_status_t value;
 
   //** Trigger the send thread to shutdown which also closes the recv thread
   log_printf(15, "close_hc: Closing ns=%d\n", ns_getid(hc->ns));
@@ -97,14 +100,14 @@ void close_hc(Host_connection_t *hc)
   hportal_lock(hc->hp); hportal_signal(hc->hp); hportal_unlock(hc->hp);
 
   //** Wait until the recv thread completes
-  pthread_join(hc->recv_thread, &ptr);
+  apr_thread_join(&value, hc->recv_thread);
 
   //** Now clean up the closed que being careful not to "join" the hc thread
   Host_connection_t *hc2;
 
    while ((hc2 = (Host_connection_t *)pop(hc->hp->closed_que)) != NULL) {
      if (hc2 != hc) {
-        pthread_join(hc2->recv_thread, &ptr);
+        apr_thread_join(&value, hc2->recv_thread);
         destroy_host_connection(hc2);
      }
    }
@@ -125,7 +128,7 @@ int check_workload(Host_connection_t *hc)
   lock_hc(hc);
   while ((hc->curr_workload > hc->hp->context->max_workload) && (hc->shutdown_request == 0)) {
      log_printf(15, "check_workload: *workload loop* shutdown_request=%d stack_size=%d curr_workload=%d\n", hc->shutdown_request, stack_size(hc->pending_stack), hc->curr_workload); 
-     pthread_cond_wait(&(hc->send_cond), &(hc->lock)); 
+     apr_thread_cond_wait(hc->send_cond, hc->lock); 
   }
      
   psize = stack_size(hc->pending_stack);
@@ -144,8 +147,8 @@ void empty_work_que(Host_connection_t *hc)
   lock_hc(hc);
   while (stack_size(hc->pending_stack) != 0) {
       log_printf(15, "empty_work_que: shutdown_request=%d stack_size=%d curr_workload=%d\n", hc->shutdown_request, stack_size(hc->pending_stack), hc->curr_workload);        
-      pthread_cond_signal(&(hc->recv_cond));
-      pthread_cond_wait(&(hc->send_cond), &(hc->lock)); 
+      apr_thread_cond_signal(hc->recv_cond);
+      apr_thread_cond_wait(hc->send_cond, hc->lock); 
   }
   unlock_hc(hc);
 }
@@ -171,7 +174,7 @@ void recv_wait_for_work(Host_connection_t *hc)
   lock_hc(hc);
   while ((hc->shutdown_request == 0) && (stack_size(hc->pending_stack) == 0)) {
      hc_send_signal(hc);
-     pthread_cond_wait(&(hc->recv_cond), &(hc->lock));
+     apr_thread_cond_wait(hc->recv_cond, hc->lock);
   }
   unlock_hc(hc);
 }
@@ -180,7 +183,7 @@ void recv_wait_for_work(Host_connection_t *hc)
 // hc_send_thread - Handles the sending phase of a command
 //*************************************************************
 
-void *hc_send_thread(void *data)
+void *hc_send_thread(apr_thread_t *th, void *data)
 {
   Host_connection_t *hc = (Host_connection_t *)data;
   Host_portal_t *hp = hc->hp;  
@@ -210,6 +213,13 @@ void *hc_send_thread(void *data)
 
   //** Store my position in the conn_list **
   hportal_lock(hp);
+  if (hc->net_connect_status == 0) {
+     hp->successful_conn_attempts++;
+     hp->failed_conn_attempts = 0;  //** Reset the failed attempts
+  } else {
+     log_printf(1, "hc_send_thread: ns=%d failing all commands failed_conn_attempts=%d\n", ns_getid(ns), hp->failed_conn_attempts);
+     hp->failed_conn_attempts++;
+  }
   push(hp->conn_list, (void *)hc);
   hc->my_pos = get_ptr(hp->conn_list);
   hportal_unlock(hp);
@@ -289,12 +299,13 @@ void *hc_send_thread(void *data)
   log_printf(15, "hc_send_thread: Exiting! (ns=%d, host=%s:%d)\n", ns_getid(ns), hp->host, hp->port);
 
   hc->shutdown_request = 1;
-  pthread_cond_signal(&(hc->recv_cond));
+  apr_thread_cond_signal(hc->recv_cond);
   unlock_hc(hc);
 
   //*** The recv side handles the removal from the hportal structure ***
   modify_hpc_thread_count(hpc, -1);
 
+  apr_thread_exit(th, 0);
   return(NULL);
 }
 
@@ -302,13 +313,13 @@ void *hc_send_thread(void *data)
 // hc_recv_thread - Handles the recving phase of a command
 //*************************************************************
 
-void *hc_recv_thread(void *data)
+void *hc_recv_thread(apr_thread_t *th, void *data)
 {
   Host_connection_t *hc = (Host_connection_t *)data;
   NetStream_t *ns = hc->ns;
   Host_portal_t *hp = hc->hp;  
   Hportal_context_t *hpc = hp->context;
-  void *ret;
+  apr_status_t value;
 
   int64_t start_cmds_processed, cmds_processed;  
   time_t check_time;
@@ -410,7 +421,7 @@ void *hc_recv_thread(void *data)
   lock_hc(hc); hc_send_signal(hc); unlock_hc(hc);
 
   //** Wait for send thread to complete **  
-  pthread_join(hc->send_thread, &ret);
+  apr_thread_join(&value, hc->send_thread);
 
   status = 0;  //** This is used to decide ifthe connection was killed
 
@@ -418,8 +429,13 @@ void *hc_recv_thread(void *data)
   if (hc->net_connect_status != 0) {  //** The connection failed
      hportal_lock(hp);
      cmds_processed = start_cmds_processed - hp->cmds_processed; 
-     if ((hp->n_conn == 0) && (cmds_processed == 0)) {  //** I'm the last thread to try and fail to connect so fail all the tasks
-        _hp_fail_tasks(hp, hpc->imp->hp_cant_connect);
+     if (cmds_processed == 0) {  //** Nothing was processed
+        if (hp->n_conn == 0) {  //** I'm the last thread to try and fail to connect so fail all the tasks
+           _hp_fail_tasks(hp, hpc->imp->hp_cant_connect);
+        } else if (hp->failed_conn_attempts > hp->abort_conn_attempts) { //** Can't connect so fail
+           log_printf(1, "hc_recv_thread: ns=%d failing all commands failed_conn_attempts=%d\n", ns_getid(ns), hp->failed_conn_attempts);
+           _hp_fail_tasks(hp, hpc->imp->hp_cant_connect);
+        }       
      }
      hportal_unlock(hp);
   } else {
@@ -465,6 +481,8 @@ void *hc_recv_thread(void *data)
   check_hportal_connections(hp);
 
   log_printf(15, "hc_recv_thread: Exiting routine! ns=%d\n", ns_getid(ns));
+
+  apr_thread_exit(th, 0);
   
   return(NULL);
 }
@@ -477,15 +495,19 @@ void *hc_recv_thread(void *data)
 int create_host_connection(Host_portal_t *hp)
 {
   Host_connection_t *hc;
+  apr_pool_t *pool;
 
   modify_hpc_thread_count(hp->context, 1);
 
-  hc = new_host_connection();
+  apr_pool_create(&pool, NULL);
+
+  hc = new_host_connection(pool);
   hc->hp = hp;
   hc->last_used = time(NULL);
   
-  pthread_create(&(hc->send_thread), NULL, hc_send_thread, (void *)hc);
-  pthread_create(&(hc->recv_thread), NULL, hc_recv_thread, (void *)hc);
+
+  apr_thread_create(&(hc->send_thread), NULL, hc_send_thread, (void *)hc, hc->mpool);
+  apr_thread_create(&(hc->recv_thread), NULL, hc_recv_thread, (void *)hc, hc->mpool);
 
   return(0);
 }

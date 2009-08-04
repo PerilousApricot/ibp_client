@@ -3,36 +3,44 @@ EXTRA_CFLAGS = -O2
 
 #Change this to where your IBP is located
 PREFIX=/workspace/local
+#PREFIX=/c/code/mingw/local
+#PREFIX=/cygdrive/c/code/local
 
 #For Phoebus support uncomment these lines
-PHOEBUS = -D_ENABLE_PHOEBUS -DHAVE_STDINT_H
-PHOEBUS_LIB = -llsl_client -ldl
+#PHOEBUS = -D_ENABLE_PHOEBUS -DHAVE_STDINT_H
+#PHOEBUS_LIB = -llsl_client -ldl
+#PHOEBUS_OBJS = net_phoebus.o net_fd.o
 #No phoebus support
-#PHOEBUS = 
-#PHOEBUS_LIB = 
+PHOEBUS = 
+PHOEBUS_LIB = 
+PHOEBUS_OBJS = net_phoebus.o
 
 target=
 FLAVOR=-D_LINUX64BIT
 CFLAGS = -g -fPIC -Wall -I${IBP_INC} -I. ${FLAVOR} ${PHOEBUS} -D_ENABLE_DEBUG -D_LARGEFILE_SOURCE -D_FILE_OFFSET_BITS=64 -D_REENTRANT -D_THREAD_SAFE ${EXTRA_CFLAGS}
+#FLAVOR=-D_MINGW32BIT
+#CFLAGS = -g  -Wall -I${IBP_INC} -I. ${FLAVOR} ${PHOEBUS} -D_ENABLE_DEBUG -D_LARGEFILE_SOURCE -D_FILE_OFFSET_BITS=64 -D_REENTRANT -D_THREAD_SAFE ${EXTRA_CFLAGS}
 LDINC = ld -i -o
 
 
 CC = gcc
-#LIBS = -L${IBP_LIB} -libp -lpthread
-LIBS = -L${PREFIX}/lib -lglib-2.0 ${PHOEBUS_LIB} -lpthread -lm
-INC_DIR= -I. -I${PREFIX}/include -I${PREFIX}/include/glib-2.0
+#INC_DIR= -I. -I${PREFIX}/include -I${PREFIX}/include/glib-2.0
+LIBS = -L${PREFIX}/lib -lapr-1 ${PHOEBUS_LIB} -lpthread -lm 
+#LIBS = -L${PREFIX}/lib -lapr-1 ${PHOEBUS_LIB} -lrpcrt4 -lshell32 -lws2_32 -ladvapi32 -lkernel32 -lmsvcrt
+INC_DIR= -I. -I${PREFIX}/include -I${PREFIX}/include/apr-1
+LIB_LIBS = 
 
 NETWORK_OBJS = \
          network.o \
          net_sock.o \
          net_1_ssl.o \
          net_2_ssl.o \
-         net_fd.o \
-         net_phoebus.o
+         ${PHOEBUS_OBJS}
 
 IBP_OBJS = \
     hconnection.o \
     oplist.o \
+    opque.o \
     ibp_oplist.o \
     ibp_config.o \
     hportal.o \
@@ -48,6 +56,7 @@ IBP_OBJS = \
     log.o \
     debug.o \
     stack.o \
+    iniparse.o \
     phoebus.o \
     ${NETWORK_OBJS}
 
@@ -63,6 +72,7 @@ TARGETS = ibp_perf ibp_copyperf ibp_test ibp_tool ${IBP_LIB} libibp.so
 SRCS=*.c 
 
 all: depend ${TARGETS}
+#all: ${TARGETS}
 
 ibp_perf: ${IBP_PERF_OBJS}
 	${CC} -g ${CFLAGS} ${INC_DIR} $^ -o $@ ${LIBS}
@@ -75,7 +85,7 @@ ibp_tool: ${IBP_TOOL_OBJS}
 libibp.a: ${IBP_OBJS}
 	ar rcs libibp.a ${IBP_OBJS}
 libibp.so: ${IBP_OBJS}
-	gcc -shared -W1,-soname,libibp.so -o libibp.so ${IBP_OBJS}
+	gcc -shared -W1,-soname,libibp.so -o libibp.so ${IBP_OBJS} ${LIB_LIBS}
 
 #===========================================
 #

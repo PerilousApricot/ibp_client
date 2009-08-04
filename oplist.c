@@ -27,16 +27,16 @@ Nashville, TN 37203
 http://www.accre.vanderbilt.edu
 */
 
+#include <apr_thread_mutex.h>
+#include <apr_thread_cond.h>
 #include <stdlib.h>
 #include <string.h>
 #include "log.h"
 #include "oplist.h"
 
-//#define lock_oplist(opl)   pthread_mutex_lock(&(opl->lock))
-//#define unlock_oplist(opl) pthread_mutex_unlock(&(opl->lock))
-
 int _oplist_counter = -1;
-pthread_mutex_t _oplist_lock;
+apr_thread_mutex_t *_oplist_lock = NULL;
+apr_pool_t *_oplist_pool = NULL;
 
 //*************************************************************
 // init_oplist - Init's the oplist counter and lock
@@ -46,7 +46,8 @@ void init_oplist_system()
 {
   if (_oplist_counter == -1) {   //** Only init if needed
      _oplist_counter = 0;
-     pthread_mutex_init(&_oplist_lock, NULL);
+     assert(apr_pool_create(&_oplist_pool, NULL) == APR_SUCCESS);
+     assert(apr_thread_mutex_create(&_oplist_lock, APR_THREAD_MUTEX_DEFAULT, _oplist_pool) == APR_SUCCESS);
   }
 }
 
@@ -57,7 +58,8 @@ void init_oplist_system()
 void destroy_oplist_system()
 {
   if (_oplist_counter >= 0) {    
-     pthread_mutex_destroy(&_oplist_lock);
+     apr_thread_mutex_destroy(_oplist_lock);
+     apr_pool_destroy(_oplist_pool);
      _oplist_counter = -2;
   }
 }
@@ -68,13 +70,13 @@ void destroy_oplist_system()
 
 void init_oplist(oplist_t *oplist, oplist_implementation_t *imp, oplist_app_notify_t *an)
 {
-  pthread_mutex_lock(&(_oplist_lock));
+  apr_thread_mutex_lock(_oplist_lock);
   oplist->id = _oplist_counter;
   _oplist_counter++;
-  pthread_mutex_unlock(&(_oplist_lock));
+  apr_thread_mutex_unlock(_oplist_lock);
   
-  pthread_mutex_init(&(oplist->lock), NULL);
-  pthread_cond_init(&(oplist->cond), NULL);
+  apr_thread_mutex_create(&(oplist->lock), APR_THREAD_MUTEX_DEFAULT,_oplist_pool);
+  apr_thread_cond_create(&(oplist->cond), _oplist_pool);
   oplist->list = new_stack();
   oplist->finished = new_stack();
   oplist->failed = new_stack();
@@ -82,7 +84,7 @@ void init_oplist(oplist_t *oplist, oplist_implementation_t *imp, oplist_app_noti
   oplist->nleft = 0;
   oplist->started_execution = 0;
   oplist->imp = imp;
-  oplist->an = an;
+  oplist->an = NULL; app_notify_append(oplist->an,  an);
   oplist->free_mode = OPLIST_AUTO_NONE;
   oplist->finished_submission = 0;
 }
@@ -139,8 +141,8 @@ void teardown_oplist(oplist_t *iolist, int op_mode)
 
   free_stack(iolist->finished, 0);
   free_stack(iolist->failed, 0);
-  pthread_mutex_destroy(&(iolist->lock));
-  pthread_cond_destroy(&(iolist->cond));
+  apr_thread_mutex_destroy(iolist->lock);
+  apr_thread_cond_destroy(iolist->cond);
 }
 
 //*************************************************************
@@ -195,6 +197,18 @@ int add_oplist(oplist_t *iolist, void *iop)
 }
 
 //*************************************************************
+// oplist_notify_append - Adds a callback to the oplist chain
+//*************************************************************
+
+void oplist_notify_append(oplist_t *opl, oplist_app_notify_t *an)
+{
+  lock_oplist(opl);
+  app_notify_append(opl->an, an);
+  unlock_oplist(opl);
+}
+
+
+//*************************************************************
 // oplist_mark_completed - Marks a task as complete and
 //    notify the oplist
 //*************************************************************
@@ -226,7 +240,7 @@ void oplist_mark_completed(oplist_t *oplist, void *op, int status)
 
   //** Lastly trigger the signal.  The calling routine may then destroy/free the oplist**
   lock_oplist(oplist);  
-  pthread_cond_signal(&(oplist->cond));
+  apr_thread_cond_signal(oplist->cond);
   unlock_oplist(oplist);  
 
   if ((nleft == 0) && (finished == 1)) {  //** clean up
@@ -306,7 +320,7 @@ int oplist_waitall(oplist_t *oplist)
 
   do {   //** This is a do loop cause I always want to scan through the task list for errors
      //** Sleep until there are more tasks
-     if (oplist->nleft > 0) pthread_cond_wait(&(oplist->cond), &(oplist->lock)); 
+     if (oplist->nleft > 0) apr_thread_cond_wait(oplist->cond, oplist->lock); 
 
      //** Pop all the finished tasks off the list **
      while ((op = pop(oplist->finished)) != NULL) { 
@@ -338,7 +352,7 @@ void *oplist_waitany(oplist_t *iolist)
   }      
 
   while ((op = pop(iolist->finished)) == NULL) {
-     pthread_cond_wait(&(iolist->cond), &(iolist->lock)); //** Sleep until something completes
+     apr_thread_cond_wait(iolist->cond, iolist->lock); //** Sleep until something completes
   }
 
   unlock_oplist(iolist);
@@ -463,12 +477,44 @@ void app_notify_set(oplist_app_notify_t *an, void (*notify)(void *), void *data)
 
 //*************************************************************
 
-void app_notify_execute(oplist_app_notify_t *an)
+void app_notify_append(oplist_app_notify_t *root_an, oplist_app_notify_t *an)
+{
+   if (an == NULL) return;  //** Nothing to add so exit
+
+   if (root_an->tail == NULL) {
+      if (root_an->next != NULL) {
+         log_printf(0, "app_notify_append: Error root_an->tail == NULL but root_an->next != NULL");
+         abort();
+      }
+
+      root_an->tail = an;
+      root_an->next = an;
+   } else {
+     root_an->tail->next = an;
+     root_an->tail = an;
+   }
+}
+
+//*************************************************************
+
+void app_notify_single_execute(oplist_app_notify_t *an)
 {
   if (an != NULL) {
      if (an->notify != NULL) {
         an->notify(an->data);
      }
+  }
+}
+
+//*************************************************************
+
+void app_notify_execute(oplist_app_notify_t *an)
+{
+  oplist_app_notify_t *a = an;
+
+  while (a != NULL) {
+     app_notify_single_execute(a);
+     a = a->next;
   }
 }
 

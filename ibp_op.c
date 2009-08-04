@@ -31,9 +31,9 @@ http://www.accre.vanderbilt.edu
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <arpa/inet.h>
+//#include <sys/types.h>
+//#include <sys/socket.h>
+//#include <arpa/inet.h>
 #include "ibp.h"
 #include "fmttypes.h"
 #include "network.h"
@@ -41,8 +41,9 @@ http://www.accre.vanderbilt.edu
 #include "ibp_misc.h"
 #include "dns_cache.h"
 
-Net_timeout_t global_dt = {1, 0};
+Net_timeout_t global_dt = 1*1000000;
 int write_block(NetStream_t *ns, time_t end_time, char *buffer, int size);
+int status_get_recv(void *gop, NetStream_t *ns);
 
 //*************************************************************
 // set_hostport - Sets the hostport string
@@ -51,20 +52,20 @@ int write_block(NetStream_t *ns, time_t end_time, char *buffer, int size);
 
 void set_hostport(char *hostport, int max_size, char *host, int port, ibp_connect_context_t *cc)
 {
-  char in_addr[6];
+  char in_addr[DNS_ADDR_MAX];
   char ip[64];
   int type;
 
   type = (cc == NULL) ? NS_TYPE_SOCK : cc->type;
 
-  if (lookup_host(host, in_addr) != 0) {
+  if (lookup_host(host, in_addr, ip) != 0) {
      log_printf(1, "set_hostport:  Failed to lookup host: %s\n", host);
      hostport[max_size-1] = '\0';
      snprintf(hostport, max_size-1, "%s:%d:%d:0", host, port, type);   
      return;
   }
 
-  inet_ntop(AF_INET, (void *)in_addr, ip, 63);
+//  inet_ntop(AF_INET, (void *)in_addr, ip, 63);
   ip[63] = '\0';
 
   hostport[max_size-1] = '\0';
@@ -108,26 +109,38 @@ int send_command(NetStream_t *ns, char *command)
 
 int readline_with_timeout(NetStream_t *ns, char *buffer, int size, time_t end_time)
 {
-  int nbytes, n;
+  int nbytes, n, nleft;
   int err;
 
+  log_printf(15, "readline_with_timeout: START ns=%d size=%d\n", ns_getid(ns), size);
   nbytes = 0;
   err = 0;
-  while ((err == 0) && (time(NULL) <= end_time)){
-     n = readline_netstream_raw(ns, &(buffer[nbytes]), size, global_dt, &err);
+  nleft = size;
+  while ((err == 0) && (time(NULL) <= end_time) && (nleft > 0)){
+     n = readline_netstream_raw(ns, &(buffer[nbytes]), nleft, global_dt, &err);
+     nleft = nleft - n;
      nbytes = nbytes + n;
-     log_printf(15, "readline_with_timeout: nbytes=%d err=%d time=" TT " end_time=" TT " ns=%d\n", nbytes, err, time(NULL), end_time, ns_getid(ns));
+     log_printf(15, "readline_with_timeout: nbytes=%d nleft=%d err=%d time=" TT " end_time=" TT " ns=%d buffer=%s\n", nbytes, nleft, err, time(NULL), end_time, ns_getid(ns), buffer);
   }
 
   if (err > 0) {
      err = IBP_OK;
+     log_printf(15, "readline_with_timeout: END nbytes=%d command=%s\n", nbytes, buffer);
   } else {
 //     close_netstream(ns);    //** Either the connection is dead or there is a problem
      if (err == 0) {
-        log_printf(15, "readline_with_timeout: Client timeout time=" TT " end_time=" TT "ns=%d\n", time(NULL), end_time, ns_getid(ns));
-        err = IBP_E_CLIENT_TIMEOUT;
+        if (nbytes < size) {
+           log_printf(15, "readline_with_timeout: END Client timeout time=" TT " end_time=" TT "ns=%d\n", time(NULL), end_time, ns_getid(ns));
+        } else {
+           log_printf(0, "readline_with_timeout:  END Out of sync issue!! nbytes=%d size=%d ns=%d\n", nbytes, size, ns_getid(ns));
+           flush_log();
+           err = 0; //** GEnerate a core dump
+           err = 1 / err;
+        }
+//        err = IBP_E_CLIENT_TIMEOUT;
+        err = ERR_RETRY_DEADSOCKET;
      } else {
-        log_printf(15, "readline_with_timeout: connection error=%d ns=%d\n", err, ns_getid(ns));
+        log_printf(15, "readline_with_timeout: END connection error=%d ns=%d\n", err, ns_getid(ns));
 //        err = IBP_E_CONNECTION;
         err = ERR_RETRY_DEADSOCKET;
      }
@@ -382,8 +395,8 @@ int read_recv(void *gop, NetStream_t *ns)
   status = atoi(string_token(buffer, " ", &bstate, &err));
   nbytes = atol(string_token(NULL, " ", &bstate, &err));
   if ((status != IBP_OK) || (nbytes != cmd->size)) {
-     log_printf(15, "read_recv: (read) ns=%d cap=%s offset=%d len=%d err=%d Error!  status/nbytes=!%s!\n", 
-          ns_getid(ns), cmd->cap, cmd->offset, cmd->size, err, buffer);
+     log_printf(15, "read_recv: (read) ns=%d cap=%s offset=%d len=%d err=%d Error!  status=%d bytes=!%s!\n", 
+          ns_getid(ns), cmd->cap, cmd->offset, cmd->size, err, status, buffer);
      return(status);
   }
 
@@ -757,6 +770,29 @@ int allocate_command(void *gop, NetStream_t *ns)
 
 //*************************************************************
 
+int split_allocate_command(void *gop, NetStream_t *ns)
+{
+  ibp_op_t *op = (ibp_op_t *)gop;
+  char buffer[1024]; 
+  time_t atime;
+  int err;
+  ibp_op_alloc_t *cmd = &(op->alloc_op);
+
+  atime = cmd->attr->duration - time(NULL);
+  snprintf(buffer, sizeof(buffer), "%d %d %s %s %d %d " TT " %d %d\n", 
+       IBPv040, IBP_SPLIT_ALLOCATE, cmd->key, cmd->typekey, cmd->attr->reliability, cmd->attr->type, 
+       atime, cmd->size, op->hop.timeout);
+
+  err = send_command(ns, buffer);
+  if (err != IBP_OK) {
+     log_printf(10, "split_allocate_command: Error with send_command()! ns=%d\n", ns_getid(ns));
+  }
+
+  return(err);
+}
+
+//*************************************************************
+
 int allocate_recv(void *gop, NetStream_t *ns)
 {
   ibp_op_t *op = (ibp_op_t *)gop;
@@ -778,7 +814,7 @@ int allocate_recv(void *gop, NetStream_t *ns)
 
   sscanf(string_token(buffer, " ", &bstate, &fin), "%d", &status);
   if (status != IBP_OK) {
-     log_printf(0, "alloc_recv: ns=%d Error! status=%d buffer=%s\n", ns_getid(ns), status, buffer);
+     log_printf(1, "alloc_recv: ns=%d Error! status=%d buffer=%s\n", ns_getid(ns), status, buffer);
      return(status);
   }        
 
@@ -792,7 +828,7 @@ int allocate_recv(void *gop, NetStream_t *ns)
   if ((strlen(rcap) == 0) || (strlen(wcap) == 0) || (strlen(mcap) == 0)) {
      log_printf(0, "alloc_recv: ns=%d Error reading caps!  buffer=%s\n", ns_getid(ns), buffer);
      if (sscanf(buffer, "%d", &status) != 1) {
-        log_printf(0, "alloc_recv: ns=%d Can't read status!\n", ns_getid(ns));
+        log_printf(1, "alloc_recv: ns=%d Can't read status!\n", ns_getid(ns));
         return(IBP_E_GENERIC);
      } else {
         return(status);
@@ -819,15 +855,15 @@ void set_ibp_alloc_op(ibp_op_t *op, ibp_capset_t *caps, int size, ibp_depot_t *d
   char hoststr[1024];
   ibp_op_alloc_t *cmd;
 
-log_printf(15, "set_ibp_alloc_op: start. _hpc_config=%p\n", _hpc_config);
+//log_printf(15, "set_ibp_alloc_op: start. _hpc_config=%p\n", _hpc_config);
 
   if (cc==NULL) cc = &(_ibp_config->cc[IBP_ALLOCATE]);
   set_hostport(hoststr, sizeof(hoststr), depot->host, depot->port, cc);
 
-log_printf(15, "set_ibp_alloc_op: before init_ibp_base_op\n");
+//log_printf(15, "set_ibp_alloc_op: before init_ibp_base_op\n");
 
   init_ibp_base_op(op, "alloc", timeout, 10*_ibp_config->new_command, strdup(hoststr), 1, IBP_ALLOCATE, IBP_NOP, an, cc);
-log_printf(15, "set_ibp_alloc_op: after init_ibp_base_op\n");
+//log_printf(15, "set_ibp_alloc_op: after init_ibp_base_op\n");
 
   cmd = &(op->alloc_op);
   cmd->caps = caps;
@@ -850,6 +886,51 @@ ibp_op_t *new_ibp_alloc_op(ibp_capset_t *caps, int size, ibp_depot_t *depot, ibp
   ibp_op_t *op = new_ibp_op();
   
   set_ibp_alloc_op(op, caps, size, depot, attr, timeout, an, cc);
+
+  return(op);
+}
+
+//*************************************************************
+//  set_ibp_split_alloc_op - generates a new IBP_SPLIT_ALLOCATION operation
+//*************************************************************
+
+void set_ibp_split_alloc_op(ibp_op_t *op, ibp_cap_t *mcap, ibp_capset_t *caps, int size, 
+       ibp_attributes_t *attr, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc)
+{
+  char hoststr[1024];
+  char host[256];
+  ibp_op_alloc_t *cmd;
+  int port;
+
+  init_ibp_base_op(op, "split_allocate", timeout, 10*_ibp_config->new_command, NULL, 1, IBP_SPLIT_ALLOCATE, IBP_NOP, an, cc);
+
+  cmd = &(op->alloc_op);
+
+  parse_cap(mcap, host, &port, cmd->key, cmd->typekey);
+  if (cc==NULL) cc = &(_ibp_config->cc[IBP_SPLIT_ALLOCATE]);
+  set_hostport(hoststr, sizeof(hoststr), host, port, cc);
+  op->hop.hostport = strdup(hoststr);
+
+  cmd = &(op->alloc_op);
+  cmd->caps = caps;
+  cmd->attr = attr;
+  cmd->size = size;
+
+  op->hop.send_command = split_allocate_command;
+  op->hop.send_phase = NULL;
+  op->hop.recv_phase = allocate_recv;
+}
+
+//*************************************************************
+//  new_ibp_split_alloc_op - generates a new IBP_SPLIT_ALLOCATION operation
+//*************************************************************
+
+ibp_op_t *new_ibp_split_alloc_op(ibp_cap_t *mcap, ibp_capset_t *caps, int size,
+       ibp_attributes_t *attr, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc)
+{
+  ibp_op_t *op = new_ibp_op();
+  
+  set_ibp_split_alloc_op(op, mcap, caps, size, attr, timeout, an, cc);
 
   return(op);
 }
@@ -922,12 +1003,81 @@ ibp_op_t *new_ibp_rename_op(ibp_capset_t *caps, ibp_cap_t *mcap,
 }
 
 //=============================================================
-//  Proxy Allocate routines
+//  Merge routines
 //=============================================================
 
 //*************************************************************
 
-int proxy_allocate_command(void *gop, NetStream_t *ns)
+int merge_command(void *gop, NetStream_t *ns)
+{
+  ibp_op_t *op = (ibp_op_t *)gop;
+  char buffer[1024]; 
+  int err;
+  ibp_op_merge_alloc_t *cmd = &(op->merge_op);
+
+  snprintf(buffer, sizeof(buffer), "%d %d %s %s %s %s %d\n", 
+       IBPv040, IBP_MERGE_ALLOCATE, cmd->mkey, cmd->mtypekey, cmd->ckey, cmd->ctypekey, op->hop.timeout);
+
+  err = send_command(ns, buffer);
+  if (err != IBP_OK) {
+     log_printf(10, "merge_command: Error with send_command()! ns=%d\n", ns_getid(ns));
+  }
+
+  return(err);
+}
+
+//*************************************************************
+//  set_ibp_merge_alloc_op - generates a new IBP_MERGE_ALLOCATE operation
+//*************************************************************
+
+void set_ibp_merge_alloc_op(ibp_op_t *op, ibp_cap_t *mcap, ibp_cap_t *ccap, int timeout, 
+    oplist_app_notify_t *an, ibp_connect_context_t *cc)
+{
+  char hoststr[1024];
+  char host[256];
+  char chost[256];
+  ibp_op_merge_alloc_t *cmd;
+  int port, cport;
+
+  log_printf(15, "set_ibp_merge_op: start. _hpc_config=%p\n", _hpc_config);
+
+  init_ibp_base_op(op, "rename", timeout, 10*_ibp_config->new_command, NULL, 1, IBP_RENAME, IBP_NOP, an, cc);
+
+  cmd = &(op->merge_op);
+
+  parse_cap(mcap, host, &port, cmd->mkey, cmd->mtypekey);
+  if (cc==NULL) cc = &(_ibp_config->cc[IBP_MERGE_ALLOCATE]);
+  set_hostport(hoststr, sizeof(hoststr), host, port, cc);
+  op->hop.hostport = strdup(hoststr);
+
+  parse_cap(ccap, chost, &cport, cmd->ckey, cmd->ctypekey);
+
+  op->hop.send_command = merge_command;
+  op->hop.send_phase = NULL;
+  op->hop.recv_phase = status_get_recv;
+}
+
+//*************************************************************
+//  new_ibp_merge_alloc_op - Creates a new IBP_MERGE_ALLOCATION operation
+//*************************************************************
+
+ibp_op_t *new_ibp_merge_alloc_op(ibp_cap_t *mcap, ibp_cap_t *ccap,  
+       int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc)
+{
+  ibp_op_t *op = new_ibp_op();
+  
+  set_ibp_merge_alloc_op(op, mcap, ccap, timeout, an, cc);
+
+  return(op);
+}
+
+//=============================================================
+//  Alias Allocate routines
+//=============================================================
+
+//*************************************************************
+
+int alias_allocate_command(void *gop, NetStream_t *ns)
 {
   ibp_op_t *op = (ibp_op_t *)gop;
   char buffer[1024]; 
@@ -935,21 +1085,21 @@ int proxy_allocate_command(void *gop, NetStream_t *ns)
   ibp_op_alloc_t *cmd = &(op->alloc_op);
 
   snprintf(buffer, sizeof(buffer), "%d %d %s %s %d %d %d %d\n", 
-       IBPv040, IBP_PROXY_ALLOCATE, cmd->key, cmd->typekey, cmd->offset, cmd->size, cmd->duration, op->hop.timeout);
+       IBPv040, IBP_ALIAS_ALLOCATE, cmd->key, cmd->typekey, cmd->offset, cmd->size, cmd->duration, op->hop.timeout);
 
   err = send_command(ns, buffer);
   if (err != IBP_OK) {
-     log_printf(10, "proxy_allocate_command: Error with send_command()! ns=%d\n", ns_getid(ns));
+     log_printf(10, "alias_allocate_command: Error with send_command()! ns=%d\n", ns_getid(ns));
   }
 
   return(err);
 }
 
 //*************************************************************
-//  set_ibp_proxy_alloc_op - generates a new IBP_PROXY_ALLOC operation
+//  set_ibp_alias_alloc_op - generates a new IBP_ALIAS_ALLOC operation
 //*************************************************************
 
-void set_ibp_proxy_alloc_op(ibp_op_t *op, ibp_capset_t *caps, ibp_cap_t *mcap, int offset, int size, 
+void set_ibp_alias_alloc_op(ibp_op_t *op, ibp_capset_t *caps, ibp_cap_t *mcap, int offset, int size, 
    int duration, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc)
 {
   char hoststr[1024];
@@ -957,14 +1107,14 @@ void set_ibp_proxy_alloc_op(ibp_op_t *op, ibp_capset_t *caps, ibp_cap_t *mcap, i
   ibp_op_alloc_t *cmd;
   int port;
 
-  log_printf(15, "set_ibp_proxy_alloc_op: start. _hpc_config=%p\n", _hpc_config);
+  log_printf(15, "set_ibp_alias_alloc_op: start. _hpc_config=%p\n", _hpc_config);
 
-  init_ibp_base_op(op, "rename", timeout, 10*_ibp_config->new_command, NULL, 1, IBP_PROXY_ALLOCATE, IBP_NOP, an, cc);
+  init_ibp_base_op(op, "rename", timeout, 10*_ibp_config->new_command, NULL, 1, IBP_ALIAS_ALLOCATE, IBP_NOP, an, cc);
 
   cmd = &(op->alloc_op);
 
   parse_cap(mcap, host, &port, cmd->key, cmd->typekey);
-  if (cc==NULL) cc = &(_ibp_config->cc[IBP_PROXY_ALLOCATE]);
+  if (cc==NULL) cc = &(_ibp_config->cc[IBP_ALIAS_ALLOCATE]);
   set_hostport(hoststr, sizeof(hoststr), host, port, cc);
   op->hop.hostport = strdup(hoststr);
 
@@ -979,21 +1129,21 @@ void set_ibp_proxy_alloc_op(ibp_op_t *op, ibp_capset_t *caps, ibp_cap_t *mcap, i
 
   cmd->caps = caps;
 
-  op->hop.send_command = proxy_allocate_command;
+  op->hop.send_command = alias_allocate_command;
   op->hop.send_phase = NULL;
   op->hop.recv_phase = allocate_recv;
 }
 
 //*************************************************************
-//  new_ibp_proxy_alloc_op - Creates a new IBP_PROXY_ALLOC operation
+//  new_ibp_alias_alloc_op - Creates a new IBP_ALIAS_ALLOC operation
 //*************************************************************
 
-ibp_op_t *new_ibp_proxy_alloc_op(ibp_capset_t *caps, ibp_cap_t *mcap, int offset, int size, 
+ibp_op_t *new_ibp_alias_alloc_op(ibp_capset_t *caps, ibp_cap_t *mcap, int offset, int size, 
    int duration, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc)
 {
   ibp_op_t *op = new_ibp_op();
   
-  set_ibp_proxy_alloc_op(op, caps, mcap, offset, size, duration, timeout, an, cc);
+  set_ibp_alias_alloc_op(op, caps, mcap, offset, size, duration, timeout, an, cc);
 
   return(op);
 }
@@ -1027,7 +1177,7 @@ int modify_count_command(void *gop, NetStream_t *ns)
 
 //*************************************************************
 
-int proxy_modify_count_command(void *gop, NetStream_t *ns)
+int alias_modify_count_command(void *gop, NetStream_t *ns)
 {
   ibp_op_t *op = (ibp_op_t *)gop;
   char buffer[1024]; 
@@ -1084,8 +1234,8 @@ void set_ibp_generic_modify_count_op(int command, ibp_op_t *op, ibp_cap_t *cap, 
   char host[256];
   ibp_op_probe_t *cmd;
 
-  if ((command != IBP_MANAGE) && (command != IBP_PROXY_MANAGE)) {
-     log_printf(0, "set_ibp_generic_modify_count_op: Invalid command! should be IBP_MANAGE or IBP_PROXY_MANAGE.  Got %d\n", command);
+  if ((command != IBP_MANAGE) && (command != IBP_ALIAS_MANAGE)) {
+     log_printf(0, "set_ibp_generic_modify_count_op: Invalid command! should be IBP_MANAGE or IBP_ALIAS_MANAGE.  Got %d\n", command);
      return;
   }  
   if ((mode != IBP_INCR) && (mode != IBP_DECR)) {
@@ -1106,7 +1256,7 @@ void set_ibp_generic_modify_count_op(int command, ibp_op_t *op, ibp_cap_t *cap, 
   set_hostport(hoststr, sizeof(hoststr), host, port, cc);
   op->hop.hostport = strdup(hoststr);
 
-  if (command == IBP_PROXY_MANAGE) parse_cap(mcap, host, &port, cmd->mkey, cmd->mtypekey);
+  if (command == IBP_ALIAS_MANAGE) parse_cap(mcap, host, &port, cmd->mkey, cmd->mtypekey);
 
   cmd->cmd = command;
   cmd->cap = cap;
@@ -1114,7 +1264,7 @@ void set_ibp_generic_modify_count_op(int command, ibp_op_t *op, ibp_cap_t *cap, 
   cmd->captype = captype;
 
   op->hop.send_command = modify_count_command;
-  if (command == IBP_PROXY_MANAGE) op->hop.send_command = proxy_modify_count_command;
+  if (command == IBP_ALIAS_MANAGE) op->hop.send_command = alias_modify_count_command;
   op->hop.send_phase = NULL;
   op->hop.recv_phase = status_get_recv;
 }
@@ -1141,22 +1291,22 @@ ibp_op_t *new_ibp_modify_count_op(ibp_cap_t *cap, int mode, int captype, int tim
 }
 
 //*************************************************************
-//  *_ibp_proxy_modify_count_op - Generates an operation to modify 
-//     a PROXY allocations reference count
+//  *_ibp_alias_modify_count_op - Generates an operation to modify 
+//     a ALIAS allocations reference count
 //*************************************************************
 
-void set_ibp_proxy_modify_count_op(ibp_op_t *op, ibp_cap_t *cap, ibp_cap_t *mcap, int mode, int captype, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc)
+void set_ibp_alias_modify_count_op(ibp_op_t *op, ibp_cap_t *cap, ibp_cap_t *mcap, int mode, int captype, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc)
 {
-  set_ibp_generic_modify_count_op(IBP_PROXY_MANAGE, op, cap, mcap, mode, captype, timeout, an, cc);
+  set_ibp_generic_modify_count_op(IBP_ALIAS_MANAGE, op, cap, mcap, mode, captype, timeout, an, cc);
 }
 
 //***************************
 
-ibp_op_t *new_ibp_proxy_modify_count_op(ibp_cap_t *cap, ibp_cap_t *mcap, int mode, int captype, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc)
+ibp_op_t *new_ibp_alias_modify_count_op(ibp_cap_t *cap, ibp_cap_t *mcap, int mode, int captype, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc)
 {
   ibp_op_t *op = new_ibp_op();
 
-  set_ibp_generic_modify_count_op(IBP_PROXY_MANAGE, op, cap, mcap, mode, captype, timeout, an, cc);
+  set_ibp_generic_modify_count_op(IBP_ALIAS_MANAGE, op, cap, mcap, mode, captype, timeout, an, cc);
 
   return(op);
 }
@@ -1238,12 +1388,12 @@ ibp_op_t *new_ibp_modify_alloc_op(ibp_cap_t *cap, size_t size, time_t duration, 
 }
 
 //=============================================================
-// Proxy Modify allocation routines
+// Alias Modify allocation routines
 //=============================================================
 
 //*************************************************************
 
-int proxy_modify_alloc_command(void *gop, NetStream_t *ns)
+int alias_modify_alloc_command(void *gop, NetStream_t *ns)
 {
   ibp_op_t *op = (ibp_op_t *)gop;
   char buffer[1024]; 
@@ -1256,25 +1406,25 @@ int proxy_modify_alloc_command(void *gop, NetStream_t *ns)
   atime = cmd->duration - time(NULL);
 
   snprintf(buffer, sizeof(buffer), "%d %d %s %s %d " ST " " ST " " TT " %s %s %d\n", 
-       IBPv040, IBP_PROXY_MANAGE, cmd->key, cmd->typekey, IBP_CHNG, cmd->offset,  cmd->size, atime, 
+       IBPv040, IBP_ALIAS_MANAGE, cmd->key, cmd->typekey, IBP_CHNG, cmd->offset,  cmd->size, atime, 
        cmd->mkey, cmd->mtypekey, op->hop.timeout);
 
-//  log_printf(0, "proxy_modify_alloc_command: buffer=!%s!\n", buffer);
+//  log_printf(0, "alias_modify_alloc_command: buffer=!%s!\n", buffer);
 
   err = send_command(ns, buffer);
   if (err != IBP_OK) {
-     log_printf(10, "proxy_modify_count_command: Error with send_command()! ns=%d\n", ns_getid(ns));
+     log_printf(10, "alias_modify_count_command: Error with send_command()! ns=%d\n", ns_getid(ns));
   }
 
   return(err);
 }
 
 //*************************************************************
-// set_ibp_proxy_modify_alloc_op - Modifes the size, duration, and 
+// set_ibp_alias_modify_alloc_op - Modifes the size, duration, and 
 //   reliability of an existing allocation.
 //*************************************************************
 
-void set_ibp_proxy_modify_alloc_op(ibp_op_t *op, ibp_cap_t *cap, ibp_cap_t *mcap, size_t offset, size_t size, time_t duration, 
+void set_ibp_alias_modify_alloc_op(ibp_op_t *op, ibp_cap_t *cap, ibp_cap_t *mcap, size_t offset, size_t size, time_t duration, 
      int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc)
 {
   char hoststr[1024];
@@ -1282,12 +1432,12 @@ void set_ibp_proxy_modify_alloc_op(ibp_op_t *op, ibp_cap_t *cap, ibp_cap_t *mcap
   char host[256];
   ibp_op_modify_alloc_t *cmd;
   
-  init_ibp_base_op(op, "proxy_modify_alloc", timeout, 10*_ibp_config->new_command, NULL, 1, IBP_PROXY_MANAGE, IBP_CHNG, an, cc);
+  init_ibp_base_op(op, "alias_modify_alloc", timeout, 10*_ibp_config->new_command, NULL, 1, IBP_ALIAS_MANAGE, IBP_CHNG, an, cc);
 
   cmd = &(op->mod_alloc_op);
 
   parse_cap(cap, host, &port, cmd->key, cmd->typekey);
-  if (cc==NULL) cc = &(_ibp_config->cc[IBP_PROXY_MANAGE]);
+  if (cc==NULL) cc = &(_ibp_config->cc[IBP_ALIAS_MANAGE]);
   set_hostport(hoststr, sizeof(hoststr), host, port, cc);
   op->hop.hostport = strdup(hoststr);
 
@@ -1298,7 +1448,7 @@ void set_ibp_proxy_modify_alloc_op(ibp_op_t *op, ibp_cap_t *cap, ibp_cap_t *mcap
   cmd->size = size;
   cmd->duration = duration;
 
-  op->hop.send_command = proxy_modify_alloc_command;
+  op->hop.send_command = alias_modify_alloc_command;
   op->hop.send_phase = NULL;
   op->hop.recv_phase = status_get_recv;
   
@@ -1306,11 +1456,11 @@ void set_ibp_proxy_modify_alloc_op(ibp_op_t *op, ibp_cap_t *cap, ibp_cap_t *mcap
 
 //*************************************************************
 
-ibp_op_t *new_ibp_proxy_modify_alloc_op(ibp_cap_t *cap, ibp_cap_t *mcap, size_t offset, size_t size, time_t duration, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc)
+ibp_op_t *new_ibp_alias_modify_alloc_op(ibp_cap_t *cap, ibp_cap_t *mcap, size_t offset, size_t size, time_t duration, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc)
 {
   ibp_op_t *op = new_ibp_op();
 
-  set_ibp_proxy_modify_alloc_op(op, cap, mcap, offset, size, duration, timeout, an, cc);
+  set_ibp_alias_modify_alloc_op(op, cap, mcap, offset, size, duration, timeout, an, cc);
 
   return(op);
 }
@@ -1338,21 +1488,21 @@ ibp_op_t *new_ibp_remove_op(ibp_cap_t *cap, int timeout, oplist_app_notify_t *an
 }
 
 //*************************************************************
-//  set_ibp_proxy_remove_op - Generates a remove proxy allocation operation
+//  set_ibp_alias_remove_op - Generates a remove alias allocation operation
 //*************************************************************
 
-void set_ibp_proxy_remove_op(ibp_op_t *op, ibp_cap_t *cap, ibp_cap_t *mcap, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc)
+void set_ibp_alias_remove_op(ibp_op_t *op, ibp_cap_t *cap, ibp_cap_t *mcap, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc)
 {
-  set_ibp_proxy_modify_count_op(op, cap, mcap, IBP_DECR, IBP_READCAP, timeout, an, cc);
+  set_ibp_alias_modify_count_op(op, cap, mcap, IBP_DECR, IBP_READCAP, timeout, an, cc);
 }
 
 //*************************************************************
-//  new_ibp_proxy_remove_op - Generates/Creates a remove proxy allocation operation
+//  new_ibp_alias_remove_op - Generates/Creates a remove alias allocation operation
 //*************************************************************
 
-ibp_op_t *new_ibp_proxy_remove_op(ibp_cap_t *cap, ibp_cap_t *mcap, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc)
+ibp_op_t *new_ibp_alias_remove_op(ibp_cap_t *cap, ibp_cap_t *mcap, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc)
 {
-  return(new_ibp_proxy_modify_count_op(cap, mcap, IBP_DECR, IBP_READCAP, timeout, an, cc));
+  return(new_ibp_alias_modify_count_op(cap, mcap, IBP_DECR, IBP_READCAP, timeout, an, cc));
 }
 
 //=============================================================
@@ -1459,12 +1609,12 @@ ibp_op_t *new_ibp_probe_op(ibp_cap_t *cap, ibp_capstatus_t *probe, int timeout, 
 }
 
 //=============================================================
-//  IBP_PROBE routines of IBP_PROXY_MANAGE
+//  IBP_PROBE routines of IBP_ALIAS_MANAGE
 //=============================================================
 
 //*************************************************************
 
-int proxy_probe_command(void *gop, NetStream_t *ns)
+int alias_probe_command(void *gop, NetStream_t *ns)
 {
   ibp_op_t *op = (ibp_op_t *)gop;
   char buffer[1024]; 
@@ -1474,11 +1624,11 @@ int proxy_probe_command(void *gop, NetStream_t *ns)
   cmd = &(op->probe_op);
 
   snprintf(buffer, sizeof(buffer), "%d %d %s %s %d %d %d \n", 
-       IBPv040, IBP_PROXY_MANAGE, cmd->key, cmd->typekey, IBP_PROBE, IBP_MANAGECAP, op->hop.timeout);
+       IBPv040, IBP_ALIAS_MANAGE, cmd->key, cmd->typekey, IBP_PROBE, IBP_MANAGECAP, op->hop.timeout);
 
   err = send_command(ns, buffer);
   if (err != IBP_OK) {
-     log_printf(10, "proxy_probe_command: Error with send_command()! ns=%d\n", ns_getid(ns));
+     log_printf(10, "alias_probe_command: Error with send_command()! ns=%d\n", ns_getid(ns));
   }
 
   return(err);
@@ -1486,26 +1636,26 @@ int proxy_probe_command(void *gop, NetStream_t *ns)
 
 //*************************************************************
 
-int proxy_probe_recv(void *gop, NetStream_t *ns)
+int alias_probe_recv(void *gop, NetStream_t *ns)
 {
   ibp_op_t *op = (ibp_op_t *)gop;
   int status;
   char buffer[1025];
   int err;
   char *bstate;
-  ibp_proxy_capstatus_t *p;
+  ibp_alias_capstatus_t *p;
 
   //** Need to read the depot status info
-  log_printf(15, "proxy_probe_recv: ns=%d Start", ns->id);
+  log_printf(15, "alias_probe_recv: ns=%d Start", ns->id);
 
   err = readline_with_timeout(ns, buffer, sizeof(buffer), op->hop.end_time);
   if (err != IBP_OK) return(err);
 
-  log_printf(15, "proxy_probe_recv: after readline ns=%d buffer=%s\n", ns_getid(ns), buffer);
+  log_printf(15, "alias_probe_recv: after readline ns=%d buffer=%s\n", ns_getid(ns), buffer);
 
   status = atoi(string_token(buffer, " ", &bstate, &err));
   if ((status == IBP_OK) && (err == 0)) {
-     p = op->probe_op.proxy_probe;
+     p = op->probe_op.alias_probe;
      p->read_refcount = atoi(string_token(NULL, " ", &bstate, &err));
      p->write_refcount = atoi(string_token(NULL, " ", &bstate, &err));
      p->offset = atol(string_token(NULL, " ", &bstate, &err));
@@ -1517,44 +1667,44 @@ int proxy_probe_recv(void *gop, NetStream_t *ns)
 }
 
 //*************************************************************
-//  set_ibp_proxy_probe_op - Generates a new IBP_PROBE command to get
-//     information about an existing PROXY allocation
+//  set_ibp_alias_probe_op - Generates a new IBP_PROBE command to get
+//     information about an existing ALIAS allocation
 //*************************************************************
 
-void set_ibp_proxy_probe_op(ibp_op_t *op, ibp_cap_t *cap, ibp_proxy_capstatus_t *probe, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc)
+void set_ibp_alias_probe_op(ibp_op_t *op, ibp_cap_t *cap, ibp_alias_capstatus_t *probe, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc)
 {
   char hoststr[1024];
   int port;
   char host[256];
   ibp_op_probe_t *cmd;
   
-  init_ibp_base_op(op, "proxy_probe", timeout, 10*_ibp_config->new_command, NULL, 1, IBP_PROXY_MANAGE, IBP_PROBE, an, cc);
+  init_ibp_base_op(op, "alias_probe", timeout, 10*_ibp_config->new_command, NULL, 1, IBP_ALIAS_MANAGE, IBP_PROBE, an, cc);
 
   cmd = &(op->probe_op);
 
   parse_cap(cap, host, &port, cmd->key, cmd->typekey);
-  if (cc==NULL) cc = &(_ibp_config->cc[IBP_PROXY_MANAGE]);
+  if (cc==NULL) cc = &(_ibp_config->cc[IBP_ALIAS_MANAGE]);
   set_hostport(hoststr, sizeof(hoststr), host, port, cc);
   op->hop.hostport = strdup(hoststr);
 
   cmd->cap = cap;
-  cmd->proxy_probe = probe;
+  cmd->alias_probe = probe;
 
-  op->hop.send_command = proxy_probe_command;
+  op->hop.send_command = alias_probe_command;
   op->hop.send_phase = NULL;
-  op->hop.recv_phase = proxy_probe_recv;
+  op->hop.recv_phase = alias_probe_recv;
 }
 
 //*************************************************************
-//  new_ibp_proxy_probe_op - Creats and generates  a new IBP_PROBE 
-//     command to get information about an existing PROXY allocation
+//  new_ibp_alias_probe_op - Creats and generates  a new IBP_PROBE 
+//     command to get information about an existing ALIAS allocation
 //*************************************************************
 
-ibp_op_t *new_ibp_proxy_probe_op(ibp_cap_t *cap, ibp_proxy_capstatus_t *probe, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc)
+ibp_op_t *new_ibp_alias_probe_op(ibp_cap_t *cap, ibp_alias_capstatus_t *probe, int timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc)
 {
   ibp_op_t *op = new_ibp_op();
 
-  set_ibp_proxy_probe_op(op, cap, probe, timeout, an, cc);
+  set_ibp_alias_probe_op(op, cap, probe, timeout, an, cc);
 
   return(op);
 }
@@ -1676,6 +1826,98 @@ ibp_op_t *new_ibp_copyappend_op(int ns_type, char *path, ibp_cap_t *srccap, ibp_
 
   return(op);
 }
+
+//============================================================= 
+// IBP_push routines 
+// These routines allow you to push an allocation between 
+// depots.  
+//=============================================================
+
+//*************************************************************
+
+int pushpull_command(void *gop, NetStream_t *ns)
+{
+  ibp_op_t *op = (ibp_op_t *)gop;
+  char buffer[1024]; 
+  int err;
+  ibp_op_copy_t *cmd;
+
+  cmd = &(op->copy_op);
+
+  snprintf(buffer, sizeof(buffer), "%d %d %d %s %s %s %s %d %d %d %d %d %d\n", 
+       IBPv040, cmd->ibp_command, cmd->ctype, cmd->path, cmd->src_key, cmd->destcap, cmd->src_typekey, 
+       cmd->src_offset, cmd->dest_offset, cmd->len, 
+       op->hop.timeout, cmd->dest_timeout, cmd->dest_client_timeout);
+
+  err = send_command(ns, buffer);
+  if (err != IBP_OK) {
+     log_printf(10, "copyappend_command: Error with send_command()! ns=%d\n", ns_getid(ns));
+  }
+
+  return(err);
+}
+
+//*************************************************************
+
+//*************************************************************
+// set_ibp_copy_op - Generates a new depot copy operation
+//*************************************************************
+
+void set_ibp_copy_op(ibp_op_t *op, int mode, int ns_type, char *path, ibp_cap_t *srccap, ibp_cap_t *destcap, 
+        int src_offset, int dest_offset, int size, int src_timeout, int  dest_timeout, 
+        int dest_client_timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc)
+{
+  char hoststr[1024];
+  int port;
+  char host[256];
+  ibp_op_copy_t *cmd;
+
+  init_ibp_base_op(op, "copy", src_timeout, _ibp_config->new_command + size, NULL, size, IBP_SEND, IBP_NOP, an, cc);
+  
+  cmd = &(op->copy_op);
+  
+  parse_cap(srccap, host, &port, cmd->src_key, cmd->src_typekey);
+  if (cc==NULL) cc = &(_ibp_config->cc[IBP_SEND]);
+  set_hostport(hoststr, sizeof(hoststr), host, port, cc);
+  op->hop.hostport = strdup(hoststr);
+
+  cmd->ibp_command = mode;
+  if (ns_type == NS_TYPE_PHOEBUS) { 
+     cmd->ctype = IBP_PHOEBUS;
+     cmd->path = path;
+     if (cmd->path == NULL) cmd->path = "auto";  //** If NULL default to auto
+  } else {    //** All other ns types don't use the path
+     cmd->ctype = IBP_TCP;
+     cmd->path = "\0";
+  }
+
+  cmd->srccap = srccap;
+  cmd->destcap = destcap;
+  cmd->len = size;
+  cmd->src_offset = src_offset;
+  cmd->dest_offset = dest_offset;
+  cmd->dest_timeout = dest_timeout;
+  cmd->dest_client_timeout = dest_client_timeout;
+
+  op->hop.send_command = pushpull_command;
+  op->hop.send_phase = NULL;
+  op->hop.recv_phase = copy_recv;
+}
+
+//*************************************************************
+
+ibp_op_t *new_ibp_copy_op(int mode, int ns_type, char *path, ibp_cap_t *srccap, ibp_cap_t *destcap, 
+        int src_offset, int dest_offset, int size, int src_timeout, 
+        int  dest_timeout, int dest_client_timeout, oplist_app_notify_t *an, ibp_connect_context_t *cc) 
+{
+  ibp_op_t *op = new_ibp_op();
+  if (op == NULL) return(NULL);
+
+  set_ibp_copy_op(op, mode, ns_type, path, srccap, destcap, src_offset, dest_offset, size, src_timeout, dest_timeout, dest_client_timeout, an, cc);
+
+  return(op);
+}
+
 
 //=============================================================
 //  routines to handle modifying a depot's resources

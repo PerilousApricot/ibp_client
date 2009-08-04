@@ -37,7 +37,6 @@ http://www.accre.vanderbilt.edu
 #include <string.h>
 #include <math.h>
 #include <signal.h>
-#include <glib.h>
 #include "network.h"
 #include "fmttypes.h"
 #include "network.h"
@@ -51,8 +50,9 @@ const char *_ibp_subcmd_map[45];
 const char *_ibp_st_map[6];
 const char *_ibp_rel_map[3];
 const char *_ibp_type_map[5];
+const char *_ibp_ctype_map[3];
 const char *_ibp_captype_map[4];
-const char *_ibp_command_map[18];
+const char *_ibp_command_map[IBP_MAX_NUM_CMDS+1];
 
 //*************************************************************************
 // init_tables - Initialize the constatnt tables
@@ -64,6 +64,7 @@ void init_tables()
    memset(_ibp_subcmd_map, 0, sizeof(_ibp_subcmd_map));
    memset(_ibp_st_map, 0, sizeof(_ibp_st_map));
    memset(_ibp_type_map, 0, sizeof(_ibp_type_map));
+   memset(_ibp_ctype_map, 0, sizeof(_ibp_type_map));
    memset(_ibp_rel_map, 0, sizeof(_ibp_rel_map));
    memset(_ibp_captype_map, 0, sizeof(_ibp_rel_map));
    memset(_ibp_command_map, 0, sizeof(_ibp_command_map));
@@ -128,8 +129,8 @@ void init_tables()
    _ibp_error_map[-IBP_E_INVALID_PRIVATE_KEY_FILE] = "IBP_E_INVALID_PRIVATE_KEY_FILE";
    _ibp_error_map[-IBP_E_AUTHEN_NOT_SUPPORT] = "IBP_E_AUTHEN_NOT_SUPPORT";
    _ibp_error_map[-IBP_E_AUTHENTICATION_FAILED] = "IBP_E_AUTHENTICATION_FAILED";
-   _ibp_error_map[-IBP_E_INVALID_HOST] = "IBP_E_INVALID_HOST]";
-   _ibp_error_map[-IBP_E_CANT_CONNECT] = "IBP_E_CANT_CONNECT]";
+   _ibp_error_map[-IBP_E_INVALID_HOST] = "IBP_E_INVALID_HOST";
+   _ibp_error_map[-IBP_E_CANT_CONNECT] = "IBP_E_CANT_CONNECT";
 
    _ibp_subcmd_map[IBP_PROBE] = "IBP_PROBE";
    _ibp_subcmd_map[IBP_INCR] = "IBP_INCR";
@@ -151,6 +152,9 @@ void init_tables()
    _ibp_type_map[IBP_FIFO] = "IBP_FIFO";
    _ibp_type_map[IBP_CIRQ] = "IBP_CIRQ";
 
+   _ibp_ctype_map[IBP_TCP] = "IBP_TCP";
+   _ibp_ctype_map[IBP_PHOEBUS] = "IBP_PHOEBUS";
+
    _ibp_captype_map[IBP_READCAP] = "IBP_READCAP";
    _ibp_captype_map[IBP_WRITECAP] = "IBP_WRITECAP";
    _ibp_captype_map[IBP_MANAGECAP] = "IBP_MANAGECAP";
@@ -162,10 +166,14 @@ void init_tables()
    _ibp_command_map[IBP_LOAD] = "IBP_LOAD";
    _ibp_command_map[IBP_MANAGE] = "IBP_MANAGE";
    _ibp_command_map[IBP_WRITE] = "IBP_WRITE";
-   _ibp_command_map[IBP_PROXY_ALLOCATE] = "IBP_PROXY_ALLOCATE";
-   _ibp_command_map[IBP_PROXY_MANAGE] = "IBP_PROXY_MANAGE";
+   _ibp_command_map[IBP_ALIAS_ALLOCATE] = "IBP_ALIAS_ALLOCATE";
+   _ibp_command_map[IBP_ALIAS_MANAGE] = "IBP_ALIAS_MANAGE";
    _ibp_command_map[IBP_RENAME] = "IBP_RENAME";
    _ibp_command_map[IBP_PHOEBUS_SEND] = "IBP_PHOEBUS_SEND";
+   _ibp_command_map[IBP_SPLIT_ALLOCATE] = "IBP_SPLIT_ALLOCATE";
+   _ibp_command_map[IBP_MERGE_ALLOCATE] = "IBP_MERGE_ALLOCATE";
+   _ibp_command_map[IBP_PUSH] = "IBP_PUSH";
+   _ibp_command_map[IBP_PULL] = "IBP_PULL";
 }
 
 //*************************************************************************
@@ -187,7 +195,7 @@ void print_table(const char **table, int scale, int n)
 
 void print_ibp_tables()
 {
-  printf("sizeof(map)=" LU " sizeof(char *)=" LU " table_len=" LU "\n", sizeof(_ibp_command_map), sizeof(char *), table_len(_ibp_command_map));
+  printf("sizeof(map)=" ST " sizeof(char *)=" ST " table_len=" ST "\n", sizeof(_ibp_command_map), sizeof(char *), table_len(_ibp_command_map));
   printf("\n");
   printf("IBP Commands\n");  
   printf("------------------------------------------\n");  
@@ -217,6 +225,11 @@ void print_ibp_tables()
   printf("Allocation types\n");  
   printf("------------------------------------------\n");  
   print_table(_ibp_type_map, 1, table_len(_ibp_type_map));
+  printf("\n");
+
+  printf("Connection types\n");  
+  printf("------------------------------------------\n");  
+  print_table(_ibp_ctype_map, 1, table_len(_ibp_ctype_map));
   printf("\n");
 
   printf("Error messages\n");  
@@ -312,6 +325,70 @@ int cmd_allocate(ibp_connect_context_t *cc, char **argv, int argc)
   printf("Write cap: %s\n", get_ibp_cap(&caps, IBP_WRITECAP));
   printf("Manage cap: %s\n", get_ibp_cap(&caps, IBP_MANAGECAP));
    
+  return(0);
+}
+
+//*************************************************************************
+// cmd_split_allocate - Executes a split allocate command
+//*************************************************************************
+
+int cmd_split_allocate(ibp_connect_context_t *cc, char **argv, int argc)
+{
+  ibp_attributes_t attr;
+  ibp_capset_t caps;
+  ibp_cap_t *mcap;
+  ibp_op_t op;
+  int size;
+  int err, timeout;
+
+  if (argc < 6) { printf("cmd_split_allocate: Not enough parameters.  Received %d need 6\n", argc); return(0); }
+
+  mcap = argv[0];
+  store_attr(&attr, &(argv[1]));
+  size = atol(argv[4]);
+  timeout = atoi(argv[5]);
+
+  set_ibp_split_alloc_op(&op, mcap, &caps, size, &attr, timeout, NULL, cc);
+
+  err = ibp_sync_command(&op);
+
+  if (err != IBP_OK) {
+     printf("cmd_split_allocate: Error %s(%d)\n", _ibp_error_map[-err], err);
+     return(0);
+  }
+
+  printf("Read cap: %s\n", get_ibp_cap(&caps, IBP_READCAP));
+  printf("Write cap: %s\n", get_ibp_cap(&caps, IBP_WRITECAP));
+  printf("Manage cap: %s\n", get_ibp_cap(&caps, IBP_MANAGECAP));
+   
+  return(0);
+}
+
+//*************************************************************************
+// cmd_merge_allocate - Executes a merge allocate command
+//*************************************************************************
+
+int cmd_merge_allocate(ibp_connect_context_t *cc, char **argv, int argc)
+{
+  ibp_cap_t *mcap;
+  ibp_cap_t *ccap;
+  ibp_op_t op;
+  int err, timeout;
+
+  if (argc < 3) { printf("cmd_merge_allocate: Not enough parameters.  Received %d need 3\n", argc); return(0); }
+
+  mcap = argv[0];
+  ccap = argv[1];
+  timeout = atoi(argv[2]);
+
+  set_ibp_merge_alloc_op(&op, mcap, ccap, timeout, NULL, cc);
+
+  err = ibp_sync_command(&op);
+
+  if (err != IBP_OK) {
+     printf("cmd_merge_allocate: Error %s(%d)\n", _ibp_error_map[-err], err);
+  }
+
   return(0);
 }
 
@@ -519,6 +596,8 @@ int main(int argc, char **argv)
      printf("-tcpsize tcpbufsize - Use this value, in KB, for the TCP send/recv buffer sizes\n");
      printf("-c ibp_command      - Execute an ibp_command defined below\n");
      printf("   ibp_allocate host port rid reliability type duration(sec) size(bytes) timeout(sec)\n");
+     printf("   ibp_split_allocate master_cap reliability type duration(sec) size(bytes) timeout(sec)\n");
+     printf("   ibp_merge_allocate master_cap child_cap timeout(sec)\n");
      printf("   ibp_manage IBP_PROBE manage_cap timeout(sec)\n");
      printf("              IBP_INCR|IBP_DECR manage_cap cap_type timeout(sec)\n");
      printf("              IBP_CHNG manage_cap size(bytes) duration(sec) reliability timeout(sec)\n");
@@ -576,6 +655,10 @@ int main(int argc, char **argv)
      cmd_count = argc - (i+1);
      if (strcasecmp(argv[i], _ibp_command_map[IBP_ALLOCATE]) == 0) {
         cmd_allocate(cc, cmd_args, cmd_count);
+     } else if (strcasecmp(argv[i], _ibp_command_map[IBP_SPLIT_ALLOCATE]) == 0) {
+        cmd_split_allocate(cc, cmd_args, cmd_count);
+     } else if (strcasecmp(argv[i], _ibp_command_map[IBP_MERGE_ALLOCATE]) == 0) {
+        cmd_merge_allocate(cc, cmd_args, cmd_count);
      } else if (strcasecmp(argv[i], _ibp_command_map[IBP_MANAGE]) == 0) {
         i++;
         cmd_args = &(argv[i+1]);

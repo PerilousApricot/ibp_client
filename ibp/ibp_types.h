@@ -53,13 +53,13 @@ typedef struct {  //** RID list structure
    rid_t *rl;
 } ibp_ridlist_t;
 
-typedef struct {  //** Proxy cap status
+typedef struct {  //** Alias cap status
   int read_refcount;
   int write_refcount;
   size_t offset;
   size_t size;
   long int duration;
-} ibp_proxy_capstatus_t;
+} ibp_alias_capstatus_t;
 
 //*** ibp_types.c **
 ibp_depot_t *new_ibp_depot();
@@ -84,10 +84,10 @@ void destroy_ibp_capstatus(ibp_capstatus_t *cs);
 void copy_ibp_capstatus(ibp_capstatus_t *src, ibp_capstatus_t *dest);
 void get_ibp_capstatus(ibp_capstatus_t *cs, int *readcount, int *writecount,
     int *current_size, int *max_size, ibp_attributes_t *attrib);
-ibp_proxy_capstatus_t *new_ibp_proxy_capstatus();
-void destroy_ibp_proxy_capstatus(ibp_proxy_capstatus_t *cs);
-void copy_ibp_proxy_capstatus(ibp_proxy_capstatus_t *src, ibp_proxy_capstatus_t *dest);
-void get_ibp_proxy_capstatus(ibp_proxy_capstatus_t *cs, int *readcount, int *writecount,
+ibp_alias_capstatus_t *new_ibp_alias_capstatus();
+void destroy_ibp_alias_capstatus(ibp_alias_capstatus_t *cs);
+void copy_ibp_alias_capstatus(ibp_alias_capstatus_t *src, ibp_alias_capstatus_t *dest);
+void get_ibp_alias_capstatus(ibp_alias_capstatus_t *cs, int *readcount, int *writecount,
     int *offset, int *size, int *duration);
 void ridlist_init(ibp_ridlist_t *rlist, int size);
 void ridlist_destroy(ibp_ridlist_t *rlist);

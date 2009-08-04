@@ -25,47 +25,47 @@ Advanced Computing Center for Research and Education
 230 Appleton Place
 Nashville, TN 37203
 http://www.accre.vanderbilt.edu
-*/ 
+*/
 
-//******************************************************************
-//  Header file to simplify using "?printf" routines and different 
-//  data types, like size_t. 
-//******************************************************************
+#ifndef __INIPARSE_H
+#define __INIPARSE_H
 
-#ifndef __FMTTYPES_
-#define __FMTTYPES_
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-#ifdef _LINUX64BIT
-#  define LU  "%lu"      // uint64_t 
-#  define OT  "%lu"      // offset_t
-#  define ST  "%lu"      // size_t
-#  define TT  "%lu"      // time_t
-#  define SST "%ld"      // suseconds_T
-#  define I64T "%ld"     // int64_t
-#  define LL "%lld"       // uint64_t
-#elif _LINUX32BIT
-#  define LU  "%llu"
-#  define OT  "%llu"     // offset_t
-#  define ST  "%d"       // size_t
-#  define TT  "%lu"
-#  define SST "%lu"      // suseconds_T
-#  define I64T "%lld"     // uint64_t
-#  define LL "%lld"       // uint64_t
-#elif _MINGW32BIT
-#  define LU  "%lu"
-#  define OT  "%lu"     // offset_t
-#  define ST  "%u"      // size_t
-#  define TT  "%lu"
-#  define SST "%d"      // suseconds_T
-#  define I64T "%I64d"     // int64_t
-#  define LL "%I64d"     // int64_t
-#else
-#  define LU  "%llu"
-#  define OT  "%llu"     // offset_t
-#  define ST  "%lu"      // size_t
-#  define TT  "%lu"
-#  define SST "%d"      // suseconds_T
-#  define I64T "%ld"     // uint64_t
+#include <stdio.h>
+
+struct inip_element_s {  //** Key/Value pair
+   char *key;
+   char *value;
+   struct inip_element_s *next;
+};
+typedef struct inip_element_s inip_element_t;
+
+struct inip_group_s {  //** Group
+   char *group;
+   inip_element_t *list;
+   struct inip_group_s *next;
+};
+typedef struct inip_group_s inip_group_t;
+
+typedef struct {  //File
+   inip_group_t *tree;
+} inip_file_t;
+
+
+#define inip_first_group(inip) (inip)->tree
+#define inip_get_group(group)  (group)->group
+#define inip_next_group(group) ((group) == NULL) ? NULL : (group)->group
+
+inip_file_t *inip_read(const char *fname);
+void inip_destroy(inip_file_t *inip);
+char *inip_get_string(inip_file_t *inip, const char *group, const char *key, char *def);
+int inip_get_integer(inip_file_t *inip, const char *group, const char *key, int def);
+
+#ifdef __cplusplus
+}
 #endif
 
 #endif
